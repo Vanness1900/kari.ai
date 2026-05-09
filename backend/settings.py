@@ -12,7 +12,8 @@ class Settings(BaseSettings):
     """Env vars documented in `.env.example` and CLAUDE.md."""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        # Support local dev keys in `.env.local` (common in this repo).
+        env_file=(".env", ".env.local"),
         env_file_encoding="utf-8",
         extra="ignore",
         populate_by_name=True,
@@ -38,21 +39,26 @@ class Settings(BaseSettings):
         default="gemini-2.0-flash",
         alias="DEFAULT_STUDENT_MODEL",
     )
+    default_teacher_model: str = Field(
+        default="gemini-2.0-flash",
+        alias="DEFAULT_TEACHER_MODEL",
+    )
     default_reasoning_model: str = Field(
         default="gpt-4o",
         alias="DEFAULT_REASONING_MODEL",
     )
 
-    use_llm_assessor: bool = Field(
-        default=True,
-        alias="USE_LLM_ASSESSOR",
-        description="If True and GOOGLE_API_KEY is set, assessor uses Gemini per student.",
+    enable_parallel_students: bool = Field(
+        default=False,
+        alias="ENABLE_PARALLEL_STUDENTS",
     )
-
-    use_llm_insight: bool = Field(
-        default=True,
-        alias="USE_LLM_INSIGHT",
-        description="If True and an LLM key is set, insight uses OpenAI (or Gemini fallback).",
+    enable_parallel_assessor: bool = Field(
+        default=False,
+        alias="ENABLE_PARALLEL_ASSESSOR",
+    )
+    max_concurrency: int = Field(
+        default=4,
+        alias="MAX_CONCURRENCY",
     )
 
     enable_visual_report: bool = Field(

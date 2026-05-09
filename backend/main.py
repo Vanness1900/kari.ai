@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi import Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from orchestrator.graph import blank_classroom_state, run_simulation
@@ -37,11 +38,16 @@ def health():
 
 
 @app.post("/api/simulation/start")
-def start_simulation():
+def start_simulation(
+    include_state: bool = Query(
+        default=False,
+        description="If true, return the full final ClassroomState (debug / dev only).",
+    ),
+):
     """Temporary stub runner — replaces with LangGraph BackgroundTasks + persistence later."""
     state = blank_classroom_state("session_stub")
     final = run_simulation(state)
-    return {
+    payload: dict = {
         "status": "completed",
         "session_id": final["session_id"],
         "simulation_complete": final["simulation_complete"],
@@ -49,4 +55,18 @@ def start_simulation():
         "logs_count": len(final["timestep_logs"]),
         "has_insight": final["insight_report"] is not None,
     }
+    if include_state:
+        payload["final_state"] = final
+    return payload
+
+
+@app.post("/api/simulation/debug/run")
+def debug_run_simulation():
+    """
+    Debug endpoint: run a full simulation and return the full state,
+    including logs + per-student assessments + insight report.
+    """
+    state = blank_classroom_state("session_debug")
+    final = run_simulation(state)
+    return final
 
