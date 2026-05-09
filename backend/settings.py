@@ -12,8 +12,13 @@ class Settings(BaseSettings):
     """Env vars documented in `.env.example` and CLAUDE.md."""
 
     model_config = SettingsConfigDict(
-        # Support local dev keys in `.env.local` (common in this repo).
-        env_file=(".env", ".env.local"),
+        # Support local dev keys in `backend/.env.local` regardless of cwd.
+        # NOTE: pydantic-settings resolves relative env_file paths against the process cwd,
+        # which is often the repo root when running `uvicorn backend.main:app ...`.
+        env_file=(
+            _BACKEND_DIR / ".env",
+            _BACKEND_DIR / ".env.local",
+        ),
         env_file_encoding="utf-8",
         extra="ignore",
         populate_by_name=True,
