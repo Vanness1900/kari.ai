@@ -7,7 +7,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from orchestrator.graph import blank_classroom_state, run_simulation
+from orchestrator.state import blank_classroom_state
+from orchestrator.graph import run_simulation
 from settings import get_settings
 
 
