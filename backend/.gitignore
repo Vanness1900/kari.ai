@@ -2,3 +2,5 @@
 sessions/
 uploads/
 chroma_db/
+.env.Local
+
