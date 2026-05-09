@@ -45,7 +45,7 @@ def run_teacher(state: ClassroomState) -> dict:
 
     rag_context = build_context(
         query=retrieval_query,
-        k=2
+        k=10
     )
 
     settings = get_settings()
