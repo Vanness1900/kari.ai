@@ -114,7 +114,7 @@ class ClassroomState(TypedDict):
     curriculum: CurriculumConfig
     students: list[StudentProfile]
     current_module: int
-    current_timestep: int        # 1=deliver, 2=process, 3=exercise, 4=assess, 5=update
+    current_timestep: int        # 1=deliver, 2=qna, 3=exercise, 4=assess, 5=update
     timestep_logs: list[TimestepLog]   # full trace across the whole run (source of truth for growth)
     # Assessor (after loop): one structured record per student — NOT a single whole-class verdict.
     # Value shape → define AssessmentRecord TypedDict in code (scores, growth notes, at_risk, ...).
@@ -146,11 +146,11 @@ START
             ├──► student_swarm_node     # calls all student agents sequentially
             │         └── peer_contagion_node   # high-influence students affect neighbours
             │
-            ├──► [conditional edge — uses LIVE student state, not Assessor]
-            │         avg confusion > 0.7 (and re-teach cap not hit) → teacher_node (re-teach)
-            │         else still within module timesteps → next timestep / continue loop
-            │         else module done and more modules → next module
-            │         else all modules done → assessor_phase (per student, sequential)
+            ├──► [conditional edge from assessor stub — forward only, no re-teach loop]
+            │         still within module timesteps 1–5 → bump_timestep → loop
+            │         finished timestep 5 + more modules → advance_module → loop
+            │         finished timestep 5 on last module → insight → END
+            │         (timestep 2 = QNA: student_questions → teacher → students — confusion relief)
             │
             ├──► assessor_node          # N sequential passes (one per student); fills student_assessments
             │
@@ -160,24 +160,31 @@ START
 
 ### Conditional Edge Logic
 
-Routers **mid-simulation** should use **student-reported** `confusion_level` (and caps), not
-the Assessor — the Assessor does not exist until the loop completes.
+Routers **mid-simulation** are **forward-only** on the timestep clock (no confusion-triggered
+re-teach). **QNA (timestep 2)** is the primary confusion-relief phase without repeating full delivery.
 
 ```python
-# orchestrator/graph.py — illustration only; labels must match your add_conditional_edges map
-def should_continue_after_students(state: ClassroomState) -> str:
-    avg_confusion = mean([s.confusion_level for s in state.students])
-    if avg_confusion > 0.7 and state.reteach_count_this_module < 2:
-        return "reteach"
+# orchestrator/graph.py — reference router after the per-round assessor node (stub in hackathon)
+def router_after_assessor(state: ClassroomState) -> str:
     if state.current_timestep < 5:
         return "next_timestep"
-    modules = state.curriculum["modules"]
+    modules = state.curriculum.get("modules") or []
     if state.current_module >= len(modules) - 1:
-        return "run_assessor"      # syllabus complete → assessor phase (once per student)
+        return "run_insight"
     return "advance_module"
 ```
 
-Then assessor phase (`student_assessments` populated) → `insight` → END.
+### Timestep semantics (per module)
+
+| `current_timestep` | Phase     | Notes |
+|--------------------|-----------|--------|
+| 1 | deliver | Teacher-generated module content → `current_lesson` |
+| 2 | qna | Clarification / questions; primary confusion relief (`student_questions` → teacher Q&A) |
+| 3 | exercise | RAG on when wired |
+| 4 | assess | RAG off |
+| 5 | update | Recap / consolidation |
+
+Then insight node after the last module (`insight_report`) → END. (Full Assessor-after-syllabus pattern remains described in code comments / future wiring.)
 
 ---
 
@@ -199,6 +206,7 @@ Agents do NOT communicate directly — everything goes through state.
 # Input:  current_lesson + student.knowledge_state + student.traits
 # Rules:
 #   - ONLY reason from knowledge_state, never from LLM's own knowledge
+#   - QNA timestep (2): clarification / questions; primary confusion relief (separate student_questions → teacher)
 #   - RAG enabled during EXERCISE timestep (timestep 3) only
 #   - RAG disabled during ASSESSMENT timestep (timestep 4)
 # Output: {
@@ -445,8 +453,8 @@ BLOOMS_LEVELS = {
 - **Peer contagion runs after all students complete a timestep** — not during.
   Order: all students process → peer contagion adjusts influence → state saved.
 
-- **Re-teach loops are capped at 2 per module** — prevent infinite loops.
-  After 2 re-teaches, orchestrator advances regardless of confusion level.
+- **QNA (timestep 2)** handles clarification and confusion relief in the forward clock — there is
+  no separate re-teach branch in the graph.
 
 - **Insight agent is a heavy call** — runs once at the end only (after Assessor phase).
 
@@ -468,7 +476,7 @@ If time is tight, cut in this order:
 SKIP FIRST   GPT Image 2 visual report
 SKIP SECOND  Peer contagion between student agents
 SKIP THIRD   Dynamic LLM-generated MCQs (use static form only)
-SKIP FOURTH  Re-teach loops (always advance after one pass)
+SKIP FOURTH  Optional confusion branches (extra QNA / mini re-deliver) — default forward clock only
 KEEP ALWAYS  Knowledge gating — without this the sim is useless
 KEEP ALWAYS  RAG open/closed book distinction
 KEEP ALWAYS  Insight agent curriculum ordering critique

@@ -1,48 +1,64 @@
-"""Assessor agent: scores students and records module progress (stub)."""
+"""Assessor agent: end-of-course per-student assessment (stub)."""
 
 from __future__ import annotations
-
-from statistics import mean
 
 from orchestrator.state import ClassroomState
 
 
 def run_assessor(state: ClassroomState) -> dict:
-    """Aggregate student signals; write `ModuleResult` when closing a module timestep 5 (stub)."""
-    mod = state["current_module"]
-    step = state["current_timestep"]
-    students = state["students"]
-    confusions = [float(s.get("confusion_level", 0.0)) for s in students]
-    avg_c = mean(confusions) if confusions else 0.0
+    """
+    End-of-course assessor phase.
 
-    updates: dict = {
-        "avg_confusion_last": avg_c,
+    Runs once per student, sequentially, after all modules/timesteps complete.
+    Each invocation assesses exactly one student (index = state["assessor_index"]).
+    """
+    idx = int(state.get("assessor_index", 0))
+    students = state["students"]
+    if idx >= len(students):
+        return {
+            "timestep_logs": [
+                {
+                    "agent": "assessor",
+                    "module_index": state["current_module"],
+                    "timestep": state["current_timestep"],
+                    "payload": {"done": True, "stub": True},
+                }
+            ]
+        }
+
+    s = students[idx]
+    sid = str(s.get("id", idx))
+    name = str(s.get("name", "Student"))
+
+    ks = s.get("knowledge_state") or {}
+    nums = [float(v) for v in ks.values() if isinstance(v, (int, float))]
+    overall = sum(nums) / len(nums) if nums else 0.5
+
+    risk_flags: list[str] = []
+    if float(s.get("confusion_level", 0.0)) > 0.65:
+        risk_flags.append("high_confusion")
+    if float(s.get("attention_remaining", 1.0)) < 0.25:
+        risk_flags.append("low_attention")
+
+    record = {
+        "student_id": sid,
+        "overall_score": float(overall),
+        "risk_flags": risk_flags,
+        "narrative": f"[stub] {name} ended with score≈{overall:.2f}. Flags={risk_flags or ['none']}.",
+    }
+
+    existing = state.get("student_assessments") or {}
+    merged = {**existing, sid: record}
+
+    return {
+        "student_assessments": merged,
+        "assessor_index": idx + 1,
         "timestep_logs": [
             {
                 "agent": "assessor",
-                "module_index": mod,
-                "timestep": step,
-                "payload": {"avg_confusion": avg_c, "stub": True},
+                "module_index": state["current_module"],
+                "timestep": state["current_timestep"],
+                "payload": {"student_id": sid, "assessor_index": idx, "stub": True},
             }
         ],
     }
-
-    # At end of module cycle (timestep 5), emit a coarse module result (production: richer).
-    if step >= 5:
-
-        def _estimate_score(student: dict) -> float:
-            ks = student.get("knowledge_state") or {}
-            nums = [float(v) for v in ks.values() if isinstance(v, (int, float))]
-            return sum(nums) / len(nums) if nums else 0.5
-
-        scores = {str(s.get("id", idx)): _estimate_score(s) for idx, s in enumerate(students)}
-        updates["module_results"] = [
-            {
-                "module_index": mod,
-                "student_scores": scores,
-                "at_risk_student_ids": [str(s.get("id")) for s in students if float(s.get("confusion_level", 0)) > 0.65],
-                "notes": "stub module result",
-            }
-        ]
-
-    return updates

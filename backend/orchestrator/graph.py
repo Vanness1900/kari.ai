@@ -12,16 +12,16 @@ What is LangGraph?
 
 Execution order in THIS file (happy path):
 ------------------------------------------
-START → orchestrator → timekeeper → teacher → student_swarm → peer_contagion → assessor
-→ *(router decides)* → bump_timestep OR advance_module OR reteach OR insight → END
+START → orchestrator → timekeeper → *(timestep 2: student_questions →)* teacher → student_swarm
+→ peer_contagion → stats → *(router decides)* → bump_timestep OR advance_module OR assessor_phase → insight → END
 
-The router implements: re-teach loops, advancing timestep 1→5 within a module, advancing
-to the next module, and finally running the insight agent once on the last module.
+Timesteps 1–5 per module: deliver → qna → exercise → assess → update. Confusion relief is **QNA
+(timestep 2)**, not a separate re-teach loop. The router advances timestep or module, or runs
+insight after the last module’s timestep 5.
 """
 
 from __future__ import annotations
 
-from statistics import mean
 from typing import Literal
 
 from langgraph.graph import END, START, StateGraph
@@ -33,57 +33,61 @@ from orchestrator.nodes import (
     insight_node,
     orchestrator_node,
     peer_contagion_node,
-    reteach_prep_node,
+    stats_node,
+    student_questions_node,
     student_swarm_node,
     teacher_node,
     timekeeper_node,
 )
 from orchestrator.state import ClassroomState, CurriculumConfig, StudentProfileDict
 
-# Every return from ``route_after_assessor`` must match a key in the dict passed to
-# ``add_conditional_edges`` below. Think of these as “exit labels” from the assessor node.
-GraphRoute = Literal["reteach", "next_timestep", "advance_module", "run_insight"]
+# Router labels after the per-timestep stats node.
+LoopRoute = Literal["next_timestep", "advance_module", "run_assessor_phase"]
+
+# After timekeeper: timestep 2 collects questions first, then the teacher answers (QNA face).
+TeachingRoute = Literal["collect_questions", "teacher_only"]
 
 
-def _avg_confusion(state: ClassroomState) -> float:
-    """Helper: average ``confusion_level`` across all students (used for re-teach routing)."""
-    levels = [float(s.get("confusion_level", 0.0)) for s in state["students"]]
-    return mean(levels) if levels else 0.0
+def route_after_timekeeper(state: ClassroomState) -> TeachingRoute:
+    """Timestep 2 — QNA: students ask, then teacher answers (same round as ``student_swarm``)."""
+    if state["current_timestep"] == 2:
+        return "collect_questions"
+    return "teacher_only"
 
 
-def route_after_assessor(state: ClassroomState) -> GraphRoute:
+def route_after_stats(state: ClassroomState) -> LoopRoute:
     """
-    Router: after grading, where do we go next?
+    Router: after one timestep's teaching + student updates + stats, where do we go next?
 
-    Checked **top to bottom** — first match wins (like an if/elif chain):
+    1) **next_timestep** — still within timesteps 1..5 for this module → bump and loop.
 
-    1) **reteach** — class is still too confused *and* we have not hit the re-teach cap (2).
-       Send flow to ``reteach_prep`` → teacher again (same timestep; no clock bump).
+    2) **run_assessor_phase** — finished timestep 5 on the *last* module → assess students.
 
-    2) **next_timestep** — still inside the same module “day” (timesteps 1..5 in CLAUDE.md).
-       We bump ``current_timestep`` and loop back through orchestrator → delivery chain.
-
-    3) **run_insight** — we finished timestep 5 on the *last* module. One final node
-       writes ``insight_report`` and sets ``simulation_complete``.
-
-    4) **advance_module** — we finished timestep 5 but more modules remain: move to the next
-       module, reset timestep to 1, clear re-teach counter, then loop back via orchestrator.
+    3) **advance_module** — finished timestep 5 with more modules → next module, timestep 1.
     """
-    # Re-teach gate (confusion + cap from CLAUDE.md)
-    if _avg_confusion(state) > 0.7 and state["reteach_count_this_module"] < 2:
-        return "reteach"
-
     # Still animating the five internal phases of the *current* module
     if state["current_timestep"] < 5:
         return "next_timestep"
 
     modules = state["curriculum"].get("modules") or []
-    # On the last module index, go generate the final report instead of advancing “module index”
+    # On the last module index, go run post-course assessor phase next.
     if state["current_module"] >= len(modules) - 1:
-        return "run_insight"
+        return "run_assessor_phase"
 
     # Middle of course: roll forward to the next module
     return "advance_module"
+
+
+# Router labels inside assessor phase.
+AssessorRoute = Literal["assess_next_student", "run_insight"]
+
+
+def route_after_assessor_phase(state: ClassroomState) -> AssessorRoute:
+    students = state["students"]
+    idx = int(state.get("assessor_index", 0))
+    if idx < len(students):
+        return "assess_next_student"
+    return "run_insight"
 
 
 def build_graph():
@@ -98,11 +102,12 @@ def build_graph():
     # --- Register node names → callables from ``nodes.py`` (each wraps an ``agents/*.py`` stub) ---
     g.add_node("orchestrator", orchestrator_node)
     g.add_node("timekeeper", timekeeper_node)
+    g.add_node("student_questions", student_questions_node)
     g.add_node("teacher", teacher_node)
     g.add_node("student_swarm", student_swarm_node)
     g.add_node("peer_contagion", peer_contagion_node)
-    g.add_node("assessor", assessor_node)
-    g.add_node("reteach_prep", reteach_prep_node)
+    g.add_node("stats", stats_node)
+    g.add_node("assessor_phase", assessor_node)
     g.add_node("bump_timestep", bump_timestep_node)
     g.add_node("advance_module", advance_module_node)
     g.add_node("insight", insight_node)
@@ -110,30 +115,44 @@ def build_graph():
     # --- Linear “teaching pipeline” for one pass through deliver → students → assess ---
     g.add_edge(START, "orchestrator")
     g.add_edge("orchestrator", "timekeeper")
-    g.add_edge("timekeeper", "teacher")
+    g.add_conditional_edges(
+        "timekeeper",
+        route_after_timekeeper,
+        {
+            "collect_questions": "student_questions",
+            "teacher_only": "teacher",
+        },
+    )
+    g.add_edge("student_questions", "teacher")
     g.add_edge("teacher", "student_swarm")
     g.add_edge("student_swarm", "peer_contagion")
-    g.add_edge("peer_contagion", "assessor")
+    g.add_edge("peer_contagion", "stats")
 
-    # Router: many possible exits from ``assessor``. The string returned by
-    # ``route_after_assessor`` chooses *one* outgoing branch.
+    # Router: after per-timestep stats, advance timestep/module or enter assessor phase.
     g.add_conditional_edges(
-        "assessor",
-        route_after_assessor,
+        "stats",
+        route_after_stats,
         {
-            "reteach": "reteach_prep",
             "next_timestep": "bump_timestep",
             "advance_module": "advance_module",
-            "run_insight": "insight",
+            "run_assessor_phase": "assessor_phase",
         },
     )
 
-    # --- Branches that feed back into the hub (or skip straight to re-delivery) ---
-    g.add_edge("reteach_prep", "teacher")  # short-circuit: more teaching, skip timekeeper hub
     # After bumping the clock or changing module, revisit orchestrator so every “round”
     # can start from the same hub (matches CLAUDE.md diagram style).
     g.add_edge("bump_timestep", "orchestrator")
     g.add_edge("advance_module", "orchestrator")
+
+    # Assessor phase: loop one student at a time until complete, then run insight.
+    g.add_conditional_edges(
+        "assessor_phase",
+        route_after_assessor_phase,
+        {
+            "assess_next_student": "assessor_phase",
+            "run_insight": "insight",
+        },
+    )
     g.add_edge("insight", END)  # terminal: no outgoing edges
 
     return g.compile()
@@ -195,10 +214,13 @@ def blank_classroom_state(
         current_timestep=1,
         timestep_logs=[],
         module_results=[],
+        student_assessments=None,
+        assessor_index=0,
         simulation_complete=False,
         insight_report=None,
         current_lesson=None,
-        reteach_count_this_module=0,
+        module_delivery_snapshot=None,
+        qna_student_questions=[],
     )
 
 
@@ -208,7 +230,7 @@ def run_simulation(initial: ClassroomState) -> ClassroomState:
 
     ``recursion_limit`` is LangGraph’s safety budget: one “step” ≈ visiting one node.
     If it is too low, you get ``GraphRecursionError`` even if your logic is fine — so we
-    scale a bit with module count (and re-teach paths add extra visits).
+    scale a bit with module count.
     """
     graph = get_graph()
     n_mod = len(initial["curriculum"].get("modules") or []) or 1
