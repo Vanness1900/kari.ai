@@ -1,6 +1,5 @@
 import fitz
 
-
 def parse_pdf(file_path: str):
 
     doc = fitz.open(file_path)
