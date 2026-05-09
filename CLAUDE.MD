@@ -46,8 +46,8 @@ kariai/
 - **localStorage** — Session persistence, no database, no auth
 
 ### LLMs
-- **Gemini Flash** — Student agents, Teacher agent, Assessor agent (high volume, cheap)
-- **GPT-4o / Gemini Pro** — Orchestrator, Insight agent (deep reasoning)
+- **Gemini Flash** — Student agents, Teacher agent, Timekeeper (high volume, cheap)
+- **GPT-4o / Gemini Pro** — Orchestrator, Insight agent (deep reasoning); optionally Assessor if not on Flash
 - **GPT Image 2** — Insight report visual generation
 
 ### No database. No auth. Runs fully locally.
@@ -108,20 +108,32 @@ GET  /api/report/{session_id} # Returns insight report
 The orchestrator is a LangGraph `StateGraph`. Every agent is a node. State is passed between nodes.
 
 ```python
-# orchestrator/state.py — ClassroomState shape
+# orchestrator/state.py — ClassroomState shape (conceptual)
 class ClassroomState(TypedDict):
     session_id: str
     curriculum: CurriculumConfig
     students: list[StudentProfile]
     current_module: int
-    current_timestep: int        # 1=deliver, 2=process, 3=exercise, 4=assess, 5=update
-    timestep_logs: list[TimestepLog]
-    module_results: list[ModuleResult]
+    current_timestep: int        # 1=deliver, 2=qna, 3=exercise, 4=assess, 5=update
+    timestep_logs: list[TimestepLog]   # full trace across the whole run (source of truth for growth)
+    # Assessor (after loop): one structured record per student — NOT a single whole-class verdict.
+    # Value shape → define AssessmentRecord TypedDict in code (scores, growth notes, at_risk, ...).
+    student_assessments: dict[str, dict] | None
     simulation_complete: bool
     insight_report: InsightReport | None
 ```
 
 ### Graph Flow
+
+**During the simulation loop** the graph runs **teacher → students → peer effects** only.
+**Confusion and `knowledge_state` updates** come from **student agent outputs** each timestep
+(LangGraph merges them into `ClassroomState`). There is **no Assessor node** in this loop.
+
+**After** every module’s timesteps have finished (entire syllabus traversed), run an **Assessor phase**:
+for **each student**, assess that learner’s arc (growth, misconceptions, at-risk signals) from
+their slice of `timestep_logs` plus their final profile — same **sequential** discipline as the
+student swarm (**no** `asyncio.gather`). Then run **Insight** (curriculum critique; may aggregate
+from `student_assessments` but Assessor itself is **per student**, not one combined class judgment).
 
 ```
 START
@@ -134,29 +146,45 @@ START
             ├──► student_swarm_node     # calls all student agents sequentially
             │         └── peer_contagion_node   # high-influence students affect neighbours
             │
-            ├──► assessor_node          # scores students, updates knowledge_state
+            ├──► [conditional edge from assessor stub — forward only, no re-teach loop]
+            │         still within module timesteps 1–5 → bump_timestep → loop
+            │         finished timestep 5 + more modules → advance_module → loop
+            │         finished timestep 5 on last module → insight → END
+            │         (timestep 2 = QNA: student_questions → teacher → students — confusion relief)
             │
-            ├──► [conditional edge]
-            │         confusion > 0.7  → back to teacher_node (re-teach)
-            │         module complete  → next module
-            │         all modules done → insight_node
+            ├──► assessor_node          # N sequential passes (one per student); fills student_assessments
             │
-            └──► insight_node
+            └──► insight_node           # curriculum critique (uses Assessor output + logs)
                       └──► END
 ```
 
 ### Conditional Edge Logic
 
+Routers **mid-simulation** are **forward-only** on the timestep clock (no confusion-triggered
+re-teach). **QNA (timestep 2)** is the primary confusion-relief phase without repeating full delivery.
+
 ```python
-# orchestrator/graph.py
-def should_advance(state: ClassroomState) -> str:
-    avg_confusion = mean([s.confusion_level for s in state.students])
-    if avg_confusion > 0.7:
-        return "reteach"
-    if state.current_module >= len(state.curriculum.modules) - 1:
-        return "finish"
-    return "advance"
+# orchestrator/graph.py — reference router after the per-round assessor node (stub in hackathon)
+def router_after_assessor(state: ClassroomState) -> str:
+    if state.current_timestep < 5:
+        return "next_timestep"
+    modules = state.curriculum.get("modules") or []
+    if state.current_module >= len(modules) - 1:
+        return "run_insight"
+    return "advance_module"
 ```
+
+### Timestep semantics (per module)
+
+| `current_timestep` | Phase     | Notes |
+|--------------------|-----------|--------|
+| 1 | deliver | Teacher-generated module content → `current_lesson` |
+| 2 | qna | Clarification / questions; primary confusion relief (`student_questions` → teacher Q&A) |
+| 3 | exercise | RAG on when wired |
+| 4 | assess | RAG off |
+| 5 | update | Recap / consolidation |
+
+Then insight node after the last module (`insight_report`) → END. (Full Assessor-after-syllabus pattern remains described in code comments / future wiring.)
 
 ---
 
@@ -178,6 +206,7 @@ Agents do NOT communicate directly — everything goes through state.
 # Input:  current_lesson + student.knowledge_state + student.traits
 # Rules:
 #   - ONLY reason from knowledge_state, never from LLM's own knowledge
+#   - QNA timestep (2): clarification / questions; primary confusion relief (separate student_questions → teacher)
 #   - RAG enabled during EXERCISE timestep (timestep 3) only
 #   - RAG disabled during ASSESSMENT timestep (timestep 4)
 # Output: {
@@ -191,15 +220,18 @@ Agents do NOT communicate directly — everything goes through state.
 
 ### Assessor Agent
 ```python
-# Input:  all student timestep logs for current module
-# Action: scores each student, updates knowledge_state
-#         extracts key failure patterns
-# Output: ModuleResult with per-student scores + at-risk flags
+# When:   After the entire simulation loop completes — not inside the teach/student timestep loop.
+# Unit:   One **student** per invocation (repeat N times, sequential queue).
+# Input:  that student’s id + filtered `timestep_logs` mentioning them + their row in `students`
+#         (final knowledge_state, misconceptions, traits, etc.)
+# Action: end-of-run judgment for **that learner only** — growth, gaps, stability, risk flags
+#         (not a single LLM call that “assesses the whole class as one lump”)
+# Output: merge into `student_assessments[student_id]` (see state shape); report UI reads per row
 ```
 
 ### Insight Agent
 ```python
-# Input:  full simulation history (all module results)
+# Input:  `student_assessments` (per-student Assessor outputs) + `timestep_logs` + curriculum
 # Action: critiques concept ordering, Bloom's alignment, pacing
 #         generates confusion heatmap data
 #         flags curriculum ordering issues
@@ -353,14 +385,17 @@ AGENT_MODELS = {
     "orchestrator": "gpt-4o",
     "timekeeper":   "gemini-2.0-flash",
     "teacher":      "gemini-2.0-flash",
-    "student":      "gemini-2.0-flash",   # called N times per timestep
-    "assessor":     "gemini-2.0-flash",
-    "insight":      "gpt-4o",             # deep curriculum reasoning
+    "student":      "gemini-2.0-flash",   # called N_students × N_timesteps × N_modules (highest volume)
+    "assessor":     "gemini-2.0-flash",   # N_students calls after loop — keep lean; or gpt-4o if few students
+    "insight":      "gpt-4o",             # deep curriculum reasoning (ONE call/run)
 }
 ```
 
 Student agents use Gemini Flash because they are called N_students × N_timesteps × N_modules
 times. This is the highest volume call in the system. Keep their prompts lean.
+**Assessor** runs **once per student** after the syllabus ends (still **N_student** LLM calls per
+simulation total). Default to Flash for parity with student swarm; use a reasoning model only if the
+cohort is small or you need richer per-learner writeups.
 
 ---
 
@@ -370,7 +405,7 @@ times. This is the highest volume call in the system. Keep their prompts lean.
 2. **Keep student system prompts under 300 tokens** — they are called the most
 3. **Knowledge gate instruction is non-negotiable** — always include it
 4. **Teacher agent stores to ChromaDB before students process** — order matters
-5. **Insight agent receives full module_results list** — not raw logs, aggregated only
+5. **Assessor runs after the loop, per student** — fills `student_assessments`; Insight then critiques curriculum using that + logs
 
 ### Student Agent Output Schema (enforce strictly)
 ```json
@@ -418,11 +453,15 @@ BLOOMS_LEVELS = {
 - **Peer contagion runs after all students complete a timestep** — not during.
   Order: all students process → peer contagion adjusts influence → state saved.
 
-- **Re-teach loops are capped at 2 per module** — prevent infinite loops.
-  After 2 re-teaches, orchestrator advances regardless of confusion level.
+- **QNA (timestep 2)** handles clarification and confusion relief in the forward clock — there is
+  no separate re-teach branch in the graph.
 
-- **Insight agent is the most expensive call** — runs once at the end only.
-  Do not call it mid-simulation.
+- **Insight agent is a heavy call** — runs once at the end only (after Assessor phase).
+
+- **Assessor phase** — runs **after** all timesteps/modules finish; **not** in the inner loop.
+  It is implemented as **one Assessor invocation per student** (sequential), writing
+  **`student_assessments`**. Do not substitute one giant “assess the whole class” call unless
+  you explicitly change this contract. Align `backend/orchestrator/graph.py` accordingly.
 
 - **GPT Image 2 call is optional** — only if `ENABLE_VISUAL_REPORT=true` in .env.
   Skip in dev to save credits.
@@ -437,7 +476,7 @@ If time is tight, cut in this order:
 SKIP FIRST   GPT Image 2 visual report
 SKIP SECOND  Peer contagion between student agents
 SKIP THIRD   Dynamic LLM-generated MCQs (use static form only)
-SKIP FOURTH  Re-teach loops (always advance after one pass)
+SKIP FOURTH  Optional confusion branches (extra QNA / mini re-deliver) — default forward clock only
 KEEP ALWAYS  Knowledge gating — without this the sim is useless
 KEEP ALWAYS  RAG open/closed book distinction
 KEEP ALWAYS  Insight agent curriculum ordering critique
