@@ -1,0 +1,4 @@
+# Local data (paths resolve under backend/ when cwd is backend)
+sessions/
+uploads/
+chroma_db/
