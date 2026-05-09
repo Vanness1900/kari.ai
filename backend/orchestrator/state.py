@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import operator
-from typing import Annotated, Any, Literal, NotRequired, TypedDict
+from typing import Annotated, Any, Literal, TypedDict
+
+from typing_extensions import NotRequired
 
 
 class CurriculumModule(TypedDict, total=False):
