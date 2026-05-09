@@ -8,6 +8,7 @@ import {
   type Dispatch,
   type SetStateAction,
 } from "react";
+import { startSimulation } from "@/lib/api";
 import {
   type CurriculumConfig,
   saveConfig,
@@ -242,6 +243,8 @@ export function ConfigScreen() {
   const [visionMissionPreset, setVisionMissionPreset] = useState("");
   const [visionMissionText, setVisionMissionText] = useState("");
   const [targetStudentsDescription, setTargetStudentsDescription] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- hydrate from localStorage after mount
@@ -301,7 +304,8 @@ export function ConfigScreen() {
     return () => document.removeEventListener("pointerdown", onPointerDown);
   }, [bloomMenuOpen]);
 
-  const handleGenerate = () => {
+  const handleGenerate = async () => {
+    if (submitting) return;
     const visionMission = visionMissionText.trim();
     const targetStudents = targetStudentsDescription.trim();
     const config: CurriculumConfig = {
@@ -316,7 +320,24 @@ export function ConfigScreen() {
       totalStudents,
     };
     saveConfig(config);
-    router.push("/main");
+
+    setSubmitting(true);
+    setSubmitError(null);
+    try {
+      const res = await startSimulation({
+        session_name: sessionName.trim() || undefined,
+        curriculum_text: content.trim() || undefined,
+        content_text: curriculum.trim() || undefined,
+        vision_mission: visionMission || undefined,
+        target_students_description: targetStudents || undefined,
+        bloom_levels: selectedBloom.trim() ? [selectedBloom.trim()] : [],
+        total_students: totalStudents,
+      });
+      router.push(`/simulation/${encodeURIComponent(res.session_id)}`);
+    } catch (e) {
+      setSubmitError(e instanceof Error ? e.message : String(e));
+      setSubmitting(false);
+    }
   };
 
   return (
@@ -635,12 +656,18 @@ export function ConfigScreen() {
             />
           </div>
 
+          {submitError && (
+            <p className="mt-4 rounded-xl bg-rose-50 px-3 py-2 text-xs text-rose-700">
+              Could not start simulation: {submitError}
+            </p>
+          )}
           <button
             type="button"
-            onClick={handleGenerate}
-            className="mt-8 w-full rounded-2xl bg-[#1DA1F2] py-3.5 text-base font-semibold text-white shadow-lg shadow-sky-300/50 transition hover:bg-[#1B8CD8] active:scale-[0.99]"
+            onClick={() => void handleGenerate()}
+            disabled={submitting}
+            className="mt-8 w-full rounded-2xl bg-[#1DA1F2] py-3.5 text-base font-semibold text-white shadow-lg shadow-sky-300/50 transition hover:bg-[#1B8CD8] active:scale-[0.99] disabled:cursor-not-allowed disabled:bg-slate-300 disabled:shadow-none"
           >
-            Generate
+            {submitting ? "Starting simulation…" : "Generate"}
           </button>
         </div>
       </div>

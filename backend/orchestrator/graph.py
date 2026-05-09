@@ -22,7 +22,7 @@ insight after the last module’s timestep 5.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Callable, Literal
 
 from langgraph.graph import END, START, StateGraph
 
@@ -40,6 +40,7 @@ from orchestrator.nodes import (
     timekeeper_node,
 )
 from orchestrator.state import ClassroomState, CurriculumConfig, StudentProfileDict
+from storage.session import save_session
 
 # Router labels after the per-timestep stats node.
 LoopRoute = Literal["next_timestep", "advance_module", "run_assessor_phase"]
@@ -213,8 +214,41 @@ def run_simulation(initial: ClassroomState) -> ClassroomState:
     If it is too low, you get ``GraphRecursionError`` even if your logic is fine — so we
     scale a bit with module count.
     """
+    return run_simulation_streaming(initial)
+
+
+def run_simulation_streaming(
+    initial: ClassroomState,
+    *,
+    on_step: Callable[[ClassroomState], None] | None = None,
+) -> ClassroomState:
+    """
+    Run the graph and persist the merged ``ClassroomState`` after every node executes.
+
+    Uses ``graph.stream(stream_mode="values")`` so each yielded chunk is the full state
+    after a node has run — exactly what a polling UI wants. ``on_step`` lets callers hook
+    in extra side-effects (default: ``save_session``).
+    """
     graph = get_graph()
     n_mod = len(initial["curriculum"].get("modules") or []) or 1
     recursion_limit = max(120, n_mod * 40)
-    final = graph.invoke(initial, config={"recursion_limit": recursion_limit})
+
+    final: ClassroomState = initial
+    for chunk in graph.stream(
+        initial,
+        config={"recursion_limit": recursion_limit},
+        stream_mode="values",
+    ):
+        final = chunk  # type: ignore[assignment]
+        sid = final.get("session_id") if isinstance(final, dict) else None
+        if sid:
+            try:
+                save_session(sid, final)
+            except Exception:
+                pass
+        if on_step is not None:
+            try:
+                on_step(final)
+            except Exception:
+                pass
     return final
