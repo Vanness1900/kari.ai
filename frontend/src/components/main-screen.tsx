@@ -4,7 +4,16 @@ import Image from "next/image";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { loadConfig, type CurriculumConfig } from "@/lib/config-storage";
+import {
+  DEFAULT_SESSION_TITLE,
+  clearConfig,
+  loadConfig,
+  type CurriculumConfig,
+} from "@/lib/config-storage";
+import {
+  LS_IMPORT_CONTENT,
+  LS_IMPORT_CURRICULUM,
+} from "@/lib/local-import-storage";
 
 type ChatRole = "user" | "ai" | "ai_card";
 
@@ -60,21 +69,42 @@ function buildDemoTranscript(config: CurriculumConfig | null): ChatMessage[] {
 
 export function MainScreen() {
   const router = useRouter();
-  const config = useMemo(() => loadConfig(), []);
+  /** undefined = have not read sessionStorage yet (SSR + first paint; avoid locking to null) */
+  const [config, setConfig] = useState<
+    CurriculumConfig | null | undefined
+  >(undefined);
   const [draft, setDraft] = useState("");
-  const endRef = useRef<HTMLDivElement>(null);
+  const chatScrollRef = useRef<HTMLDivElement>(null);
+  const didRedirectRef = useRef(false);
 
   useEffect(() => {
-    if (!config) router.replace("/");
-  }, [config, router]);
+    const c = loadConfig();
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- load from sessionStorage after mount
+    setConfig(c);
+    if (!c && !didRedirectRef.current) {
+      didRedirectRef.current = true;
+      router.replace("/");
+    }
+  }, [router]);
 
-  const messages = useMemo(() => buildDemoTranscript(config), [config]);
+  const messages = useMemo(() => buildDemoTranscript(config ?? null), [config]);
 
   const [extras, setExtras] = useState<ChatMessage[]>([]);
 
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
+    const el = chatScrollRef.current;
+    if (!el) return;
+    /** Scroll inside the chat column only — scrollIntoView() walks ancestors and jittered the viewport */
+    el.scrollTop = el.scrollHeight;
   }, [messages, extras]);
+
+  if (config === undefined) {
+    return (
+      <div className="flex min-h-screen flex-1 items-center justify-center bg-slate-50 text-sm text-slate-500">
+        Loading workspace…
+      </div>
+    );
+  }
 
   const sendUser = () => {
     const t = draft.trim();
@@ -97,7 +127,7 @@ export function MainScreen() {
     }, 450);
   };
 
-  if (!config) {
+  if (config === null) {
     return (
       <div className="flex min-h-screen flex-1 items-center justify-center bg-white text-slate-500">
         Redirecting…
@@ -106,16 +136,18 @@ export function MainScreen() {
   }
 
   const allMessages = [...messages, ...extras];
+  const sessionTitle =
+    (config.sessionName ?? "").trim() || DEFAULT_SESSION_TITLE;
 
   return (
-    <div className="flex min-h-full flex-1 flex-col bg-slate-50">
-      <header className="flex shrink-0 items-center justify-between border-b border-slate-200/80 bg-white px-4 py-3 sm:px-6">
+    <div className="flex h-dvh max-h-dvh w-full flex-col overflow-hidden bg-slate-50">
+      <header className="sticky top-0 z-30 flex shrink-0 items-center justify-between border-b border-slate-200/80 bg-white px-4 py-3 sm:px-6">
         <div>
           <p className="text-xs font-semibold uppercase tracking-wide text-[#1DA1F2]">
-            Session
+            Current session
           </p>
           <h1 className="text-lg font-semibold text-slate-900 line-clamp-1">
-            {config.curriculum || "Untitled curriculum"}
+            {sessionTitle}
           </h1>
           <p className="text-xs text-slate-500">
             {config.durationWeeks} wk · {config.classRatePerWeek}/wk ·{" "}
@@ -124,15 +156,27 @@ export function MainScreen() {
         </div>
         <Link
           href="/"
+          onClick={() => {
+            clearConfig();
+            try {
+              localStorage.removeItem(LS_IMPORT_CURRICULUM);
+              localStorage.removeItem(LS_IMPORT_CONTENT);
+            } catch {
+              // ignore storage failures
+            }
+          }}
           className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-medium text-slate-700 transition hover:border-[#1DA1F2]/40 hover:text-[#1B8CD8]"
         >
-          Edit setup
+          New Session
         </Link>
       </header>
 
-      <div className="flex min-h-[calc(100vh-52px)] flex-1 flex-col lg:flex-row">
-        <aside className="flex min-h-[320px] flex-1 flex-col border-b border-slate-200 bg-white lg:min-h-0 lg:max-w-md lg:flex-none lg:border-b-0 lg:border-r">
-          <div className="flex-1 overflow-y-auto px-3 py-4 sm:px-4">
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden lg:flex-row">
+        <aside className="flex w-full min-h-0 flex-1 basis-0 flex-col overflow-hidden border-b border-slate-200 bg-white lg:max-w-md lg:shrink-0 lg:basis-auto lg:flex-none lg:border-b-0 lg:border-r">
+          <div
+            ref={chatScrollRef}
+            className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-3 py-4 sm:px-4"
+          >
             <p className="mb-3 px-1 text-xs font-medium text-slate-500">
               AI swarm chat
             </p>
@@ -180,10 +224,9 @@ export function MainScreen() {
                 </li>
               ))}
             </ul>
-            <div ref={endRef} />
           </div>
 
-          <div className="border-t border-slate-200 p-3 sm:p-4">
+          <div className="shrink-0 border-t border-slate-200 bg-white p-3 sm:p-4">
             <div className="flex gap-2 rounded-2xl border border-slate-200 bg-slate-50 px-2 py-2 focus-within:border-[#1DA1F2]/35 focus-within:bg-white focus-within:ring-2 focus-within:ring-[#1DA1F2]/15">
               <button
                 type="button"
@@ -225,8 +268,8 @@ export function MainScreen() {
           </div>
         </aside>
 
-        <main className="flex min-h-[50vh] flex-[1.4] flex-col bg-gradient-to-br from-white via-white to-sky-50/50">
-          <div className="flex-1 overflow-y-auto px-4 py-6 sm:px-8 sm:py-8">
+        <main className="flex min-h-0 flex-1 basis-0 flex-col overflow-hidden bg-gradient-to-br from-white via-white to-sky-50/50 lg:flex-[1.4] lg:min-w-0">
+          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-6 sm:px-8 sm:py-8">
             <div className="mx-auto max-w-3xl">
               <p className="text-xs font-semibold uppercase tracking-wide text-[#1DA1F2]">
                 Report
@@ -254,6 +297,22 @@ export function MainScreen() {
                       Your content brief:{" "}
                     </span>
                     {config.content}
+                  </div>
+                )}
+                {config.visionMission && (
+                  <div className="rounded-xl bg-slate-50 p-3 text-xs whitespace-pre-wrap text-slate-600">
+                    <span className="font-semibold text-slate-800">
+                      Vision &amp; mission:{" "}
+                    </span>
+                    {config.visionMission}
+                  </div>
+                )}
+                {config.targetStudentsDescription && (
+                  <div className="rounded-xl bg-slate-50 p-3 text-xs whitespace-pre-wrap text-slate-600">
+                    <span className="font-semibold text-slate-800">
+                      Target students:{" "}
+                    </span>
+                    {config.targetStudentsDescription}
                   </div>
                 )}
               </section>
