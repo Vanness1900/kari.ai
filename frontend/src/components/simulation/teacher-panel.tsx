@@ -1,5 +1,6 @@
 "use client";
 
+import { Markdown } from "@/components/markdown";
 import type { ClassroomState } from "@/lib/api";
 
 const PHASE_LABELS: Record<number, string> = {
@@ -40,9 +41,7 @@ export function TeacherPanel({ state }: { state: ClassroomState | null }) {
       </div>
       <div className="grow overflow-auto px-5 py-4">
         {lesson ? (
-          <pre className="whitespace-pre-wrap break-words font-sans text-sm leading-relaxed text-slate-800">
-            {lesson}
-          </pre>
+          <Markdown text={lesson} />
         ) : (
           <p className="text-sm text-slate-400">Generating lesson content…</p>
         )}

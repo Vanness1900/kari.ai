@@ -1,6 +1,12 @@
 "use client";
 
-import type { ClassroomState, CurriculumModule, QnaQuestion, TimestepLog } from "@/lib/api";
+import { Markdown } from "@/components/markdown";
+import type {
+  ClassroomState,
+  CurriculumModule,
+  QnaQuestion,
+  TimestepLog,
+} from "@/lib/api";
 
 const PHASE_LABELS: Record<number, string> = {
   1: "Deliver",
@@ -10,15 +16,26 @@ const PHASE_LABELS: Record<number, string> = {
   5: "Recap",
 };
 
-type TimelineRow = {
+type TeacherTurn = {
+  kind: "teacher";
   key: string;
   module_index: number;
   timestep: number;
   phaseLabel: string;
   moduleTitle: string;
-  questions?: QnaQuestion[];
-  lesson?: string;
+  lesson: string;
 };
+
+type StudentTurn = {
+  kind: "students";
+  key: string;
+  module_index: number;
+  timestep: number;
+  moduleTitle: string;
+  questions: QnaQuestion[];
+};
+
+type Turn = TeacherTurn | StudentTurn;
 
 function asQuestions(value: unknown): QnaQuestion[] | undefined {
   if (!Array.isArray(value)) return undefined;
@@ -40,6 +57,10 @@ function asText(value: unknown): string | undefined {
   return t ? t : undefined;
 }
 
+function moduleTitle(modules: CurriculumModule[], idx: number): string {
+  return modules[idx]?.title ?? `Module ${idx + 1}`;
+}
+
 export function TeachingQnaTimeline({
   state,
   modules,
@@ -53,62 +74,89 @@ export function TeachingQnaTimeline({
 }) {
   const moduleList = modules ?? state?.curriculum.modules ?? [];
 
-  const byKey = new Map<string, TimelineRow>();
-  const ensureRow = (m: number, t: number): TimelineRow => {
-    const key = `${m}:${t}`;
-    const existing = byKey.get(key);
-    if (existing) return existing;
-    const mod = moduleList[m];
-    const phaseLabel = PHASE_LABELS[t] ?? `Step ${t}`;
-    const row: TimelineRow = {
-      key,
-      module_index: m,
-      timestep: t,
-      phaseLabel,
-      moduleTitle: mod?.title ?? `Module ${m + 1}`,
-    };
-    byKey.set(key, row);
-    return row;
+  const teacherByKey = new Map<string, string>();
+  const questionsByKey = new Map<string, QnaQuestion[]>();
+  const order: string[] = [];
+
+  const recordOrder = (k: string) => {
+    if (!order.includes(k)) order.push(k);
   };
 
   for (const e of events) {
     const m = Number(e.module_index);
     const t = Number(e.timestep);
     if (!Number.isFinite(m) || !Number.isFinite(t)) continue;
+    const payload = (e.payload ?? {}) as Record<string, unknown>;
+
     if (e.agent === "student_questions") {
-      const row = ensureRow(m, t);
-      const payload = e.payload ?? {};
-      row.questions = asQuestions((payload as Record<string, unknown>).questions);
+      const qs = asQuestions(payload.questions);
+      if (qs && qs.length > 0) {
+        const key = `q:${m}:${t}`;
+        questionsByKey.set(key, qs);
+        recordOrder(key);
+      }
       continue;
     }
     if (e.agent === "teacher") {
-      const row = ensureRow(m, t);
-      const payload = e.payload ?? {};
-      row.lesson = asText((payload as Record<string, unknown>).lesson);
+      const lesson = asText(payload.lesson);
+      if (lesson) {
+        const key = `l:${m}:${t}`;
+        teacherByKey.set(key, lesson);
+        recordOrder(key);
+      }
       continue;
     }
   }
 
-  // Fallback: while live polling, newest teacher lesson might not be in events yet.
-    if (state) {
-    const key = `${state.current_module}:${state.current_timestep}`;
-    const row = ensureRow(state.current_module, state.current_timestep);
-    if (!row.lesson) row.lesson = asText(state.current_lesson);
-    if (state.current_timestep === 2 && (!row.questions || row.questions.length === 0)) {
-      row.questions = state.qna_student_questions ?? [];
+  if (state) {
+    const m = state.current_module;
+    const t = state.current_timestep;
+    if (t === 2) {
+      const qs = state.qna_student_questions ?? [];
+      if (qs.length > 0) {
+        const key = `q:${m}:${t}`;
+        if (!questionsByKey.has(key)) {
+          questionsByKey.set(key, qs);
+          recordOrder(key);
+        }
+      }
     }
-    byKey.set(key, row);
+    const live = asText(state.current_lesson);
+    if (live) {
+      const key = `l:${m}:${t}`;
+      if (!teacherByKey.has(key)) {
+        teacherByKey.set(key, live);
+        recordOrder(key);
+      }
+    }
   }
 
-  const rows = Array.from(byKey.values())
-    .filter((r) => r.lesson || (r.questions && r.questions.length > 0))
-    .sort((a, b) =>
-      a.module_index !== b.module_index
-        ? a.module_index - b.module_index
-        : a.timestep - b.timestep,
-    );
+  const turns: Turn[] = order.map((key) => {
+    const [kind, mStr, tStr] = key.split(":");
+    const m = Number(mStr);
+    const t = Number(tStr);
+    if (kind === "q") {
+      return {
+        kind: "students",
+        key,
+        module_index: m,
+        timestep: t,
+        moduleTitle: moduleTitle(moduleList, m),
+        questions: questionsByKey.get(key) ?? [],
+      };
+    }
+    return {
+      kind: "teacher",
+      key,
+      module_index: m,
+      timestep: t,
+      phaseLabel: PHASE_LABELS[t] ?? `Step ${t}`,
+      moduleTitle: moduleTitle(moduleList, m),
+      lesson: teacherByKey.get(key) ?? "",
+    };
+  });
 
-  if (rows.length === 0) {
+  if (turns.length === 0) {
     return (
       <div
         className={
@@ -116,61 +164,88 @@ export function TeachingQnaTimeline({
           "rounded-2xl border border-dashed border-slate-200 bg-slate-50/50 p-5 text-sm text-slate-500"
         }
       >
-        Timeline will appear once the simulation starts producing teacher steps.
+        Class chat will appear once the teacher begins delivering.
       </div>
     );
   }
 
   return (
-    <div className={className ?? "rounded-2xl border border-slate-200 bg-white shadow-sm"}>
+    <div
+      className={
+        className ?? "rounded-2xl border border-slate-200 bg-white shadow-sm"
+      }
+    >
       <div className="border-b border-slate-100 bg-gradient-to-r from-slate-50 to-white px-5 py-3">
         <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-600">
-          Teaching log
+          Class chat
         </p>
         <h3 className="text-sm font-semibold text-slate-900">
-          Teacher steps + student Q&amp;A
+          Teacher delivery + student questions
         </h3>
+        <p className="mt-0.5 text-[11px] text-slate-500">
+          Full transparent feed of every teacher generation and student
+          question, in order.
+        </p>
       </div>
       <ol className="divide-y divide-slate-100">
-        {rows.map((row) => {
-          const isQna = row.timestep === 2 && (row.questions?.length ?? 0) > 0;
-          return (
-            <li key={row.key} className="px-5 py-4">
-              <div className="flex flex-wrap items-baseline justify-between gap-2">
-                <p className="text-xs font-semibold text-slate-700">
-                  Module {row.module_index + 1}: {row.moduleTitle}
+        {turns.map((turn) => {
+          if (turn.kind === "teacher") {
+            return (
+              <li key={turn.key} className="px-5 py-4">
+                <div className="flex items-baseline justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-[#1DA1F2]/10 text-[10px] font-semibold uppercase text-[#1B8CD8]">
+                      T
+                    </span>
+                    <p className="text-[11px] font-semibold uppercase tracking-wide text-[#1DA1F2]">
+                      Teacher · {turn.phaseLabel}
+                    </p>
+                  </div>
+                  <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-600">
+                    M{turn.module_index + 1} · Step {turn.timestep}/5
+                  </span>
+                </div>
+                <p className="mt-1 text-[11px] text-slate-500">
+                  {turn.moduleTitle}
                 </p>
+                <div className="mt-3 rounded-2xl border border-sky-100 bg-sky-50/40 px-4 py-3">
+                  <Markdown text={turn.lesson} />
+                </div>
+              </li>
+            );
+          }
+
+          return (
+            <li key={turn.key} className="px-5 py-4">
+              <div className="flex items-baseline justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-violet-100 text-[10px] font-semibold uppercase text-violet-700">
+                    Q
+                  </span>
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-violet-600">
+                    Students asked
+                  </p>
+                </div>
                 <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-600">
-                  {row.phaseLabel} · Step {row.timestep}/5
+                  M{turn.module_index + 1} · Q&amp;A
                 </span>
               </div>
-
-              {isQna && row.questions && (
-                <div className="mt-3 space-y-2">
-                  <p className="text-[11px] font-semibold uppercase tracking-wide text-violet-600">
-                    Questions
-                  </p>
-                  <ul className="space-y-2">
-                    {row.questions.map((q, i) => (
-                      <li key={`${q.student_id}-${i}`} className="text-sm text-slate-800">
-                        <span className="font-semibold text-slate-700">{q.name}:</span>{" "}
-                        {q.question}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-
-              {row.lesson && (
-                <div className="mt-3">
-                  <p className="text-[11px] font-semibold uppercase tracking-wide text-[#1DA1F2]">
-                    {isQna ? "Teacher answer" : "Teacher"}
-                  </p>
-                  <pre className="mt-2 max-h-[360px] overflow-auto whitespace-pre-wrap break-words rounded-xl border border-slate-200 bg-slate-50 p-3 font-sans text-sm leading-relaxed text-slate-800">
-                    {row.lesson}
-                  </pre>
-                </div>
-              )}
+              <p className="mt-1 text-[11px] text-slate-500">
+                {turn.moduleTitle}
+              </p>
+              <ul className="mt-3 space-y-2">
+                {turn.questions.map((q, i) => (
+                  <li
+                    key={`${q.student_id}-${i}`}
+                    className="rounded-2xl border border-violet-100 bg-violet-50/40 px-4 py-2 text-sm text-slate-800"
+                  >
+                    <p className="text-[11px] font-semibold text-violet-700">
+                      {q.name}
+                    </p>
+                    <p className="mt-0.5 leading-snug">{q.question}</p>
+                  </li>
+                ))}
+              </ul>
             </li>
           );
         })}
@@ -178,4 +253,3 @@ export function TeachingQnaTimeline({
     </div>
   );
 }
-

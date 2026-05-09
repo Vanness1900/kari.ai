@@ -333,7 +333,12 @@ export function ConfigScreen() {
         bloom_levels: selectedBloom.trim() ? [selectedBloom.trim()] : [],
         total_students: totalStudents,
       });
-      router.push(`/main`);
+      try {
+        sessionStorage.setItem("kari-session-id", res.session_id);
+      } catch {
+        // ignore storage failures — query param carries the id either way
+      }
+      router.push(`/main?session=${encodeURIComponent(res.session_id)}`);
     } catch (e) {
       setSubmitError(e instanceof Error ? e.message : String(e));
       setSubmitting(false);
