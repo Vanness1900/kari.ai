@@ -7,6 +7,7 @@ import { KnowledgeGrowthChart } from "@/components/simulation/knowledge-growth-c
 import { type ReportResponse, getReport } from "@/lib/api";
 import { AssessorCards } from "./assessor-cards";
 import { InsightReportView } from "./insight-report";
+import { TeachingQnaTimeline } from "@/components/simulation/teaching-qna-timeline";
 
 export function ReportView({ sessionId }: { sessionId: string }) {
   const [data, setData] = useState<ReportResponse | null>(null);
@@ -109,6 +110,11 @@ export function ReportView({ sessionId }: { sessionId: string }) {
             />
           </div>
           <InsightReportView report={data.insight_report} />
+          <TeachingQnaTimeline
+            state={null}
+            modules={modules}
+            events={data.timestep_logs}
+          />
         </section>
         <section className="space-y-4">
           <KnowledgeGrowthChart students={data.students} events={data.timestep_logs} />

@@ -114,6 +114,12 @@ export type InsightReport = {
   summary: string;
   curriculum_critique: string;
   blooms_alignment_notes: string[];
+  confusion_map?: Array<Record<string, unknown>>;
+  concept_ordering_issues?: string[];
+  student_archetype_performance?: Record<string, number>;
+  at_risk_students?: Array<Record<string, unknown>>;
+  llm_recommendations?: Array<Record<string, unknown>>;
+  visual_report_images?: string[];
 };
 
 export type ReportResponse = {

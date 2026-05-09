@@ -35,21 +35,26 @@ export function useSimulationLive(sessionId: string | null): LiveSnapshot {
   const sinceRef = useRef(0);
   const lastPhaseRef = useRef<string>("");
   const stoppedRef = useRef(false);
+  const initializedRef = useRef(false);
 
   useEffect(() => {
     if (!sessionId) return;
     stoppedRef.current = false;
     sinceRef.current = 0;
     lastPhaseRef.current = "";
-    setStatus(null);
-    setEvents([]);
-    setState(null);
-    setError(null);
+    initializedRef.current = false;
 
     let timer: ReturnType<typeof setTimeout> | null = null;
 
     const tick = async () => {
       if (stoppedRef.current) return;
+      if (!initializedRef.current) {
+        initializedRef.current = true;
+        setStatus(null);
+        setEvents([]);
+        setState(null);
+        setError(null);
+      }
       try {
         const next = await getStatus(sessionId);
         setStatus(next);
@@ -90,7 +95,7 @@ export function useSimulationLive(sessionId: string | null): LiveSnapshot {
       }
     };
 
-    void tick();
+    timer = setTimeout(tick, 0);
     return () => {
       stoppedRef.current = true;
       if (timer) clearTimeout(timer);

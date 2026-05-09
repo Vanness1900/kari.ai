@@ -9,6 +9,7 @@ import { QnaTranscript } from "./qna-transcript";
 import { StudentGrid } from "./student-grid";
 import { StudentTimeline } from "./student-timeline";
 import { TeacherPanel } from "./teacher-panel";
+import { TeachingQnaTimeline } from "./teaching-qna-timeline";
 
 const PHASE_LABELS: Record<number, string> = {
   1: "Delivering",
@@ -122,6 +123,7 @@ export function LiveSimulationView({ sessionId }: { sessionId: string }) {
             />
           </div>
           <QnaTranscript state={state} />
+          <TeachingQnaTimeline state={state} modules={modules} events={events} />
         </section>
 
         <section className="flex h-[80vh] min-h-[640px] flex-col">

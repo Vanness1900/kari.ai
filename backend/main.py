@@ -5,10 +5,12 @@ from __future__ import annotations
 import random
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from orchestrator.graph import (
@@ -235,14 +237,53 @@ def sessions_index():
     return {"sessions": list_sessions()}
 
 
+@app.get("/api/insight-image/{session_id}/{filename}")
+def get_insight_image(session_id: str, filename: str):
+    """
+    Serve GPT Image 2 insight report images.
+
+    Images are generated to: uploads/insight_reports/{session_id}/{filename}
+    """
+    if not session_id or not filename:
+        raise HTTPException(status_code=404, detail="Not found")
+    if any(part in filename for part in ("..", "/", "\\")):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    if not filename.lower().endswith(".png"):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    settings = get_settings()
+    base_dir = (settings.uploads_path / "insight_reports" / session_id).resolve()
+    file_path = (base_dir / filename).resolve()
+    if base_dir not in file_path.parents:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Not found")
+
+    return FileResponse(path=str(file_path), media_type="image/png")
+
+
 @app.get("/api/report/{session_id}")
-def get_report(session_id: str):
+def get_report(session_id: str, request: Request):
     s = _require_session(session_id)
     if not s.get("simulation_complete"):
         raise HTTPException(status_code=409, detail="Simulation has not finished yet.")
+
+    report = s.get("insight_report")
+    if isinstance(report, dict):
+        images = report.get("visual_report_images")
+        if isinstance(images, list):
+            base = str(request.base_url).rstrip("/")
+            urls: list[str] = []
+            for p in images:
+                name = Path(str(p)).name
+                if not name:
+                    continue
+                urls.append(f"{base}/api/insight-image/{session_id}/{name}")
+            report = {**report, "visual_report_images": urls}
+
     return {
         "session_id": s.get("session_id", session_id),
-        "insight_report": s.get("insight_report"),
+        "insight_report": report,
         "student_assessments": s.get("student_assessments") or {},
         "module_results": s.get("module_results") or [],
         "students": s.get("students") or [],

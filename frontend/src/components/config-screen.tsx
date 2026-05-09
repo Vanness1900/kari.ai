@@ -333,7 +333,7 @@ export function ConfigScreen() {
         bloom_levels: selectedBloom.trim() ? [selectedBloom.trim()] : [],
         total_students: totalStudents,
       });
-      router.push(`/simulation/${encodeURIComponent(res.session_id)}`);
+      router.push(`/main`);
     } catch (e) {
       setSubmitError(e instanceof Error ? e.message : String(e));
       setSubmitting(false);
