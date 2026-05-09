@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from llm.chat import llm_text
 from orchestrator.state import ClassroomState
+from settings import get_settings
 
 
 def _phase_for_timestep(step: int) -> str:
@@ -27,53 +29,51 @@ def run_teacher(state: ClassroomState) -> dict:
     step = state["current_timestep"]
     phase = _phase_for_timestep(step)
     modules = state["curriculum"].get("modules") or []
-    title = modules[mod].get("title", f"Module {mod}") if mod < len(modules) else f"Module {mod}"
+    module = modules[mod] if mod < len(modules) else {}
+    title = module.get("title", f"Module {mod}")
+    module_content = module.get("content", "")
 
+    settings = get_settings()
+    model = settings.default_teacher_model
+
+    # Build a phase-specific user prompt.
+    delivery_snapshot = (state.get("module_delivery_snapshot") or "").strip()
+    q_rows = state.get("qna_student_questions") or []
+
+    system = (
+        "You are a helpful teacher in a classroom simulation. "
+        "Write clear, structured lesson text suitable for students to read."
+    )
+    user = (
+        f"Module title: {title}\n"
+        f"Phase: {phase} (timestep {step}/5)\n\n"
+        f"Module content (syllabus/slides summary, may be empty):\n{module_content}\n\n"
+    )
     if step == 2:
-        delivery = (state.get("module_delivery_snapshot") or "").strip()
-        q_rows = state.get("qna_student_questions") or []
-        blocks: list[str] = [
-            f"## Q&A (phase 2) — «{title}»\n",
-            "### Earlier delivery (context)\n",
-            (delivery or "[No delivery snapshot yet — answer generically.]") + "\n\n",
-            "### Discussion\n",
-        ]
-        for row in q_rows:
-            who = row.get("name", "Student")
-            q = row.get("question", "")
-            blocks.append(f"**{who} asks:** {q}\n\n")
-            blocks.append(
-                f"**Teacher:** Let's clarify that directly. "
-                f"I'll tie it back to the definition we used in delivery and give a quick example "
-                f"so the class stays aligned.\n\n"
-            )
-        if not q_rows:
-            blocks.append(
-                "**Teacher:** I'll restate the main point from delivery and invite follow-ups.\n\n"
-            )
-        lesson = "".join(blocks)
+        user += (
+            "Earlier delivery snapshot (context):\n"
+            f"{delivery_snapshot}\n\n"
+            "Student questions:\n"
+            + "\n".join([f"- {r.get('name','Student')}: {r.get('question','')}" for r in q_rows])
+            + "\n\n"
+            "Answer the questions concisely, referencing the delivery. Use headings and bullets."
+        )
     elif step == 1:
-        lesson = (
-            f"[stub] DELIVER — «{title}» (phase 1/5). "
-            "Replace with LLM-generated delivery; Chroma storage handled by RAG teammate."
-        )
+        user += "Deliver the core concepts for this module in a teachable way (headings + examples)."
     elif step == 3:
-        lesson = (
-            f"[stub] EXERCISE — «{title}» (phase 3/5). "
-            "RAG on when wired; students retrieve slide chunks for practice."
-        )
+        user += "Give 3 short practice exercises and worked solutions (exercise phase)."
     elif step == 4:
-        lesson = (
-            f"[stub] ASSESS — «{title}» (phase 4/5). "
-            "RAG off — closed-book style prompts."
-        )
+        user += "Give a short closed-book quiz (5 questions) and an answer key."
     elif step == 5:
-        lesson = (
-            f"[stub] UPDATE — «{title}» (phase 5/5). "
-            "Recap / consolidation for this module."
-        )
-    else:
-        lesson = f"[stub] «{title}» — segment {step}/5 (unexpected step; treat as delivery)."
+        user += "Provide a recap and consolidation checklist + common pitfalls."
+
+    try:
+        lesson = llm_text(model=model, system=system, user=user)
+        raw_ok = True
+    except Exception as e:
+        # Fallback to stub if keys/models aren't configured yet.
+        lesson = f"[stub-fallback] {phase.upper()} — «{title}» (timestep {step}/5). LLM error: {e}"
+        raw_ok = False
 
     updates: dict = {
         "current_lesson": lesson,
@@ -82,7 +82,7 @@ def run_teacher(state: ClassroomState) -> dict:
                 "agent": "teacher",
                 "module_index": mod,
                 "timestep": step,
-                "payload": {"stub": True, "phase": phase},
+                "payload": {"phase": phase, "model": model, "llm_ok": raw_ok},
             }
         ],
     }

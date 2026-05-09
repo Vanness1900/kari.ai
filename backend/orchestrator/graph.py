@@ -78,18 +78,6 @@ def route_after_stats(state: ClassroomState) -> LoopRoute:
     return "advance_module"
 
 
-# Router labels inside assessor phase.
-AssessorRoute = Literal["assess_next_student", "run_insight"]
-
-
-def route_after_assessor_phase(state: ClassroomState) -> AssessorRoute:
-    students = state["students"]
-    idx = int(state.get("assessor_index", 0))
-    if idx < len(students):
-        return "assess_next_student"
-    return "run_insight"
-
-
 def build_graph():
     """
     Assemble nodes and edges into a runnable graph, then **compile** it to an executable object.
@@ -144,15 +132,8 @@ def build_graph():
     g.add_edge("bump_timestep", "orchestrator")
     g.add_edge("advance_module", "orchestrator")
 
-    # Assessor phase: loop one student at a time until complete, then run insight.
-    g.add_conditional_edges(
-        "assessor_phase",
-        route_after_assessor_phase,
-        {
-            "assess_next_student": "assessor_phase",
-            "run_insight": "insight",
-        },
-    )
+    # Assessor phase: assess all students (optionally parallel) then run insight.
+    g.add_edge("assessor_phase", "insight")
     g.add_edge("insight", END)  # terminal: no outgoing edges
 
     return g.compile()
