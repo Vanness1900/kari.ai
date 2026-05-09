@@ -1,0 +1,40 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Dependencies & builds (any subfolder)
+**/node_modules/
+**/.pnpm-store/
+**/dist/
+**/build/
+**/out/
+
+# Next.js
+**/.next/
+**/.turbo/
+
+# Python
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
+**/.venv/
+**/venv/
+
+# Logs & caches
+**/npm-debug.log*
+**/yarn-debug.log*
+**/yarn-error.log*
+**/.pnpm-debug.log*
+**/coverage/
+
+# Secrets
+**/.env
+**/.env.*
+!.env.example
+
+# Misc
+**/*.tsbuildinfo
+**/.vercel
