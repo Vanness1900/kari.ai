@@ -66,6 +66,7 @@ UPLOADS_PATH=./uploads
 SESSIONS_PATH=./sessions
 
 DEFAULT_STUDENT_MODEL=gemini-2.0-flash
+DEFAULT_TEACHER_MODEL=gemini-2.0-flash
 DEFAULT_REASONING_MODEL=gpt-4o
 ```
 
@@ -107,20 +108,25 @@ GET  /api/report/{session_id} # Returns insight report
 
 The orchestrator is a LangGraph `StateGraph`. Every agent is a node. State is passed between nodes.
 
+**Current code:** `backend/orchestrator/graph.py` implements the same **forward-only** timestep logic
+synchronously (teacher → student swarm → router) until the LangGraph graph is wired; keep behaviour
+in sync with this document when you port nodes.
+
 ```python
-# orchestrator/state.py — ClassroomState shape (conceptual)
+# orchestrator/state.py — ClassroomState shape (see code for TypedDicts; InsightReport uses markdown + optional figures)
 class ClassroomState(TypedDict):
     session_id: str
     curriculum: CurriculumConfig
     students: list[StudentProfile]
     current_module: int
-    current_timestep: int        # 1=deliver, 2=process, 3=exercise, 4=assess, 5=update
+    current_timestep: int  # 1=deliver 2=qna 3=exercise 4=assess 5=update — per module, then advance_module
+    current_lesson: str | None
     timestep_logs: list[TimestepLog]   # full trace across the whole run (source of truth for growth)
+    module_results: list[ModuleResult] # optional per-module aggregates (e.g. headlines for UI)
     # Assessor (after loop): one structured record per student — NOT a single whole-class verdict.
-    # Value shape → define AssessmentRecord TypedDict in code (scores, growth notes, at_risk, ...).
-    student_assessments: dict[str, dict] | None
+    student_assessments: dict[str, AssessmentRecord] | None
     simulation_complete: bool
-    insight_report: InsightReport | None
+    insight_report: InsightReport | None  # report_markdown + figures[] (0–N, e.g. base64 in JSON)
 ```
 
 ### Graph Flow
@@ -141,16 +147,16 @@ START
             │
             ├──► timekeeper_node        # advances clock, manages pacing
             │
-            ├──► teacher_node           # generates lesson content → stored in ChromaDB
+            ├──► teacher_node           # generates module-facing content → current_lesson (+ ChromaDB when wired)
             │
             ├──► student_swarm_node     # calls all student agents sequentially
             │         └── peer_contagion_node   # high-influence students affect neighbours
             │
             ├──► [conditional edge — uses LIVE student state, not Assessor]
-            │         avg confusion > 0.7 (and re-teach cap not hit) → teacher_node (re-teach)
-            │         else still within module timesteps → next timestep / continue loop
-            │         else module done and more modules → next module
+            │         default: still within module timesteps (1–5) → next timestep / loop
+            │         else module done and more modules → advance_module (reset timestep to 1)
             │         else all modules done → assessor_phase (per student, sequential)
+            │         (optional: confusion-based branches — e.g. extra QNA — not the default path)
             │
             ├──► assessor_node          # N sequential passes (one per student); fills student_assessments
             │
@@ -160,24 +166,37 @@ START
 
 ### Conditional Edge Logic
 
-Routers **mid-simulation** should use **student-reported** `confusion_level` (and caps), not
-the Assessor — the Assessor does not exist until the loop completes.
+The **default product path** does **not** re-run delivery for confusion: timestep **2 (QNA)** is where
+students clarify misunderstandings (no separate “re-teach” loop unless you add one). Routers
+**mid-simulation** still must **not** use the Assessor — it does not exist until the teach loop completes.
+
+**Reference implementation (forward-only clock)** — `backend/orchestrator/graph.py` until LangGraph wiring:
 
 ```python
-# orchestrator/graph.py — illustration only; labels must match your add_conditional_edges map
-def should_continue_after_students(state: ClassroomState) -> str:
-    avg_confusion = mean([s.confusion_level for s in state.students])
-    if avg_confusion > 0.7 and state.reteach_count_this_module < 2:
-        return "reteach"
+def router_after_swarm(state: ClassroomState, *, num_modules: int) -> str:
     if state.current_timestep < 5:
         return "next_timestep"
-    modules = state.curriculum["modules"]
-    if state.current_module >= len(modules) - 1:
-        return "run_assessor"      # syllabus complete → assessor phase (once per student)
-    return "advance_module"
+    if state.current_module < num_modules - 1:
+        return "advance_module"
+    return "finish"   # then run_assessor / insight outside or as chained nodes
 ```
 
+**Optional extension:** branch on **live** `confusion_level` (e.g. repeat QNA, inject mini-clarification)
+— keep labels consistent with `add_conditional_edges` when you move to LangGraph.
+
 Then assessor phase (`student_assessments` populated) → `insight` → END.
+
+### Timestep semantics (per module)
+
+| `current_timestep` | Phase     | Notes |
+|--------------------|-----------|--------|
+| 1                  | deliver   | Teacher-generated module content → `current_lesson` |
+| 2                  | qna       | Clarification / questions; primary “confusion relief” without repeating full delivery |
+| 3                  | exercise  | RAG on when wired (see RAG section) |
+| 4                  | assess    | RAG off |
+| 5                  | update    | Recap / consolidation step |
+
+After timestep 5 → **advance** to next `current_module` or **finish** syllabus.
 
 ---
 
@@ -188,10 +207,11 @@ Agents do NOT communicate directly — everything goes through state.
 
 ### Teacher Agent
 ```python
-# Input:  current module content from curriculum config
-# Action: generates lesson delivery for this timestep
-#         stores lesson content in ChromaDB under module key
-# Output: state.current_lesson (text delivery content)
+# Input:  current module from curriculum config; current_timestep (phase label for delivery wrapper)
+# Action: generates rich module content once per module (cache it); per timestep, set
+#         current_lesson to the appropriate slice or the same body with a phase header (DELIVER/QNA/…).
+#         stores generated delivery in ChromaDB under module key when RAG is enabled
+# Output: state.current_lesson (what student swarm reads)
 ```
 
 ### Student Agent
@@ -201,6 +221,7 @@ Agents do NOT communicate directly — everything goes through state.
 #   - ONLY reason from knowledge_state, never from LLM's own knowledge
 #   - RAG enabled during EXERCISE timestep (timestep 3) only
 #   - RAG disabled during ASSESSMENT timestep (timestep 4)
+#   - QNA timestep (2): questions / clarification; same current_lesson context, different student behaviour
 # Output: {
 #     understood: bool,
 #     confusion_level: float,   # 0.0 - 1.0
@@ -228,7 +249,7 @@ Agents do NOT communicate directly — everything goes through state.
 #         generates confusion heatmap data
 #         flags curriculum ordering issues
 #         optionally calls GPT Image 2 for visual summary
-# Output: InsightReport
+# Output: InsightReport — primary body as `report_markdown`; optional `figures[]` (0–N) for embedded visuals
 ```
 
 ---
@@ -396,7 +417,7 @@ cohort is small or you need richer per-learner writeups.
 1. **Student agent output must always be valid JSON** — add schema to every prompt
 2. **Keep student system prompts under 300 tokens** — they are called the most
 3. **Knowledge gate instruction is non-negotiable** — always include it
-4. **Teacher agent stores to ChromaDB before students process** — order matters
+4. **Teacher agent stores generated delivery to ChromaDB before students process that timestep** — order matters
 5. **Assessor runs after the loop, per student** — fills `student_assessments`; Insight then critiques curriculum using that + logs
 
 ### Student Agent Output Schema (enforce strictly)
@@ -445,8 +466,9 @@ BLOOMS_LEVELS = {
 - **Peer contagion runs after all students complete a timestep** — not during.
   Order: all students process → peer contagion adjusts influence → state saved.
 
-- **Re-teach loops are capped at 2 per module** — prevent infinite loops.
-  After 2 re-teaches, orchestrator advances regardless of confusion level.
+- **Default router is forward-only** — timesteps 1→5 per module, then `advance_module` or syllabus done.
+  **QNA (timestep 2)** handles confusion without repeating full delivery. If you add “re-teach” or
+  repeat-QNA later, cap loops explicitly to avoid infinite graphs.
 
 - **Insight agent is a heavy call** — runs once at the end only (after Assessor phase).
 
@@ -468,7 +490,7 @@ If time is tight, cut in this order:
 SKIP FIRST   GPT Image 2 visual report
 SKIP SECOND  Peer contagion between student agents
 SKIP THIRD   Dynamic LLM-generated MCQs (use static form only)
-SKIP FOURTH  Re-teach loops (always advance after one pass)
+SKIP FOURTH  Optional confusion branches (repeat QNA / mini re-deliver) — default path has none
 KEEP ALWAYS  Knowledge gating — without this the sim is useless
 KEEP ALWAYS  RAG open/closed book distinction
 KEEP ALWAYS  Insight agent curriculum ordering critique

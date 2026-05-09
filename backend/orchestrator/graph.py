@@ -1,4 +1,6 @@
-"""Phase 3: deterministic simulation loop (no LangGraph wiring yet, no LLM calls).
+"""Phase 3: deterministic simulation loop (no LangGraph wiring yet).
+
+Teacher: calls Gemini when ``GOOGLE_API_KEY`` is set (see ``agents/teacher.py``); else stub Markdown.
 
 Flow per syllabus unit (module):
     timekeeper-ready state → teacher (material + delivery) → student_swarm → advance clock
@@ -17,7 +19,9 @@ from __future__ import annotations
 
 import copy
 
+from agents.teacher import generate_module_markdown
 from orchestrator.state import ClassroomState
+from settings import Settings, get_settings
 
 
 def run_simulation(state: ClassroomState) -> ClassroomState:
@@ -25,11 +29,12 @@ def run_simulation(state: ClassroomState) -> ClassroomState:
     s: ClassroomState = copy.deepcopy(dict(state))
 
     modules = s["curriculum"]["modules"]
+    settings = get_settings()
 
     generated_for_module_idx: dict[int, str] = {}
 
     while not s["simulation_complete"]:
-        s = teacher_step(s, generated_for_module_idx)
+        s = teacher_step(s, generated_for_module_idx, settings=settings)
         s = student_swarm_step(s)
 
         route = router_after_swarm(s, num_modules=len(modules))
@@ -41,6 +46,8 @@ def run_simulation(state: ClassroomState) -> ClassroomState:
 def teacher_step(
     state: ClassroomState,
     generated_for_module_idx: dict[int, str],
+    *,
+    settings: Settings,
 ) -> ClassroomState:
     """Teacher: generate-once-per-module stored in generated_for_module_idx; reflect in current_lesson each timestep."""
     mi = state["current_module"]
@@ -48,13 +55,7 @@ def teacher_step(
     mod = state["curriculum"]["modules"][mi]
 
     if mi not in generated_for_module_idx:
-        # Later: swap this whole block for an LLM call that expands summary → full lesson + outline.
-        generated_for_module_idx[mi] = (
-            f"## {mod['title']}\n\n"
-            f"_Bloom level_: {mod['blooms_level']}\n\n"
-            f"{mod['summary']}\n\n"
-            f"(Stub generated content for module `{mod['id']}`.)"
-        )
+        generated_for_module_idx[mi] = generate_module_markdown(mod, settings=settings)
 
     body = generated_for_module_idx[mi]
 

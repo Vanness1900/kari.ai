@@ -38,6 +38,10 @@ class Settings(BaseSettings):
         default="gemini-2.0-flash",
         alias="DEFAULT_STUDENT_MODEL",
     )
+    default_teacher_model: str = Field(
+        default="gemini-2.0-flash",
+        alias="DEFAULT_TEACHER_MODEL",
+    )
     default_reasoning_model: str = Field(
         default="gpt-4o",
         alias="DEFAULT_REASONING_MODEL",
