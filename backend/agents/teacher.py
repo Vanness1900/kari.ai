@@ -6,6 +6,8 @@ from llm.chat import llm_text
 from orchestrator.state import ClassroomState
 from settings import get_settings
 
+from rag.context_builder import build_context
+
 
 def _phase_for_timestep(step: int) -> str:
     return {1: "deliver", 2: "qna", 3: "exercise", 4: "assess", 5: "update"}.get(
@@ -33,6 +35,19 @@ def run_teacher(state: ClassroomState) -> dict:
     title = module.get("title", f"Module {mod}")
     module_content = module.get("content", "")
 
+    retrieval_query = f"""
+    Module Titile:
+    {title}
+
+    Module Content:
+    {module_content}
+    """
+
+    rag_context = build_context(
+        query=retrieval_query,
+        k=2
+    )
+
     settings = get_settings()
     model = settings.default_teacher_model
 
@@ -41,12 +56,18 @@ def run_teacher(state: ClassroomState) -> dict:
     q_rows = state.get("qna_student_questions") or []
 
     system = (
-        "You are a helpful teacher in a classroom simulation. "
-        "Write clear, structured lesson text suitable for students to read."
+        "You are a real strict, objective teacher in a classroom simulation. (Ex: Professor Matthew Yee-King or Professor Francesco Nava from LSE)."
+        "Never refer to the user, uploaded materials or provided lists directly. Speak as if naturally conducting a live lesson."
+        "You can be kind, but adjust accordingly based on the classroom situation. (Ex: Student scores an A+, compliment them). "
+        "Explain concepts progressively and naturally."
+        "Use examples and transitions between ideas."
+        "You should just deliver, ensuring the students will understand the content that you are teaching. Do not sound like textbook revision notes."
+        "Do not simply summarize source material and avoid excessive questioning."
     )
     user = (
         f"Module title: {title}\n"
         f"Phase: {phase} (timestep {step}/5)\n\n"
+        f"Retrieved Currciculum Context: {rag_context}"
         f"Module content (syllabus/slides summary, may be empty):\n{module_content}\n\n"
     )
     if step == 2:

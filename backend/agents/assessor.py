@@ -24,8 +24,11 @@ def _assess_one(*, state: ClassroomState, idx: int, model: str) -> tuple[str, di
 
     system = (
         "You are an assessor evaluating ONE student's learning arc across a simulated course. "
+        "Score only from the provided student state and simulation logs. "
+        "Do not infer facts from outside context. "
         "Be concrete and concise. Output plain text."
     )
+    
     user = (
         f"Student: {name} ({sid})\n"
         f"Final student state:\n{s}\n\n"
