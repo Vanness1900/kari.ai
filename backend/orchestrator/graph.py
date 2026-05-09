@@ -1,6 +1,6 @@
 """Phase 3: deterministic simulation loop (no LangGraph wiring yet).
 
-Teacher: calls Gemini when ``GOOGLE_API_KEY`` is set (see ``agents/teacher.py``); else stub Markdown.
+Teacher: OpenAI ``gpt-5.5`` only (see ``agents/teacher.py``); stub Markdown if no ``OPENAI_API_KEY``.
 
 Flow per syllabus unit (module):
     timekeeper-ready state → teacher (material + delivery) → student_swarm → advance clock
@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import copy
 
-from agents.teacher import generate_module_markdown
+from agents.student import apply_agent_output_to_student, run_student_turn
+from agents.teacher import current_lesson_for_timestep, generate_timestep_markdown
 from orchestrator.state import ClassroomState
 from settings import Settings, get_settings
 
@@ -31,11 +32,11 @@ def run_simulation(state: ClassroomState) -> ClassroomState:
     modules = s["curriculum"]["modules"]
     settings = get_settings()
 
-    generated_for_module_idx: dict[int, str] = {}
+    generated_lessons: dict[tuple[int, int], str] = {}
 
     while not s["simulation_complete"]:
-        s = teacher_step(s, generated_for_module_idx, settings=settings)
-        s = student_swarm_step(s)
+        s = teacher_step(s, generated_lessons, settings=settings)
+        s = student_swarm_step(s, settings=settings)
 
         route = router_after_swarm(s, num_modules=len(modules))
         s = apply_route(s, route)
@@ -45,89 +46,60 @@ def run_simulation(state: ClassroomState) -> ClassroomState:
 
 def teacher_step(
     state: ClassroomState,
-    generated_for_module_idx: dict[int, str],
+    generated_lessons: dict[tuple[int, int], str],
     *,
     settings: Settings,
 ) -> ClassroomState:
-    """Teacher: generate-once-per-module stored in generated_for_module_idx; reflect in current_lesson each timestep."""
+    """Teacher: one generated body per (module, timestep); DELIVER text is reused for later phases."""
     mi = state["current_module"]
     t = state["current_timestep"]
     mod = state["curriculum"]["modules"][mi]
 
-    if mi not in generated_for_module_idx:
-        generated_for_module_idx[mi] = generate_module_markdown(mod, settings=settings)
+    key = (mi, t)
+    if key not in generated_lessons:
+        deliver = generated_lessons.get((mi, 1)) if t > 1 else None
+        generated_lessons[key] = generate_timestep_markdown(
+            mod, t, settings=settings, deliver_lesson=deliver
+        )
 
-    body = generated_for_module_idx[mi]
-
-    phase = {1: "DELIVER", 2: "QNA", 3: "EXERCISE", 4: "ASSESS", 5: "UPDATE"}[t]
-    state["current_lesson"] = f"[{phase} | timestep {t}/5]\n\n{body}"
+    body = generated_lessons[key]
+    state["current_lesson"] = current_lesson_for_timestep(body, t)
     return state
 
 
-def student_swarm_step(state: ClassroomState) -> ClassroomState:
-    """Sequential faux students — preserves 'no asyncio.gather' discipline for later."""
+def student_swarm_step(state: ClassroomState, *, settings: Settings) -> ClassroomState:
+    """One LLM (or stub) call per student, sequential — never asyncio.gather."""
     mi = state["current_module"]
     t = state["current_timestep"]
     logs = state["timestep_logs"]
+    module_title = state["curriculum"]["modules"][mi]["title"]
 
     for student in state["students"]:
         sid = student["id"]
-
-        if t == 1:
-            k_delta = 0.05 + 0.01 * student["motivation"]
-            student["confusion_level"] = max(0.0, student["confusion_level"] - 0.05)
-            understood = student["motivation"] > 0.45
-            action = "engaged"
-        elif t == 2:
-            # qna tends to shave confusion slightly; sometimes a question fires
-            k_delta = 0.03
-            student["confusion_level"] = max(0.0, student["confusion_level"] - 0.10)
-            if student["social_anxiety"] > 0.55 and student["confusion_level"] > 0.35:
-                action = "confused"
-            else:
-                action = "asked_question"
-                student["confusion_level"] *= 0.85
-            understood = student["confusion_level"] < 0.5
-        elif t == 3:
-            if student["attention_remaining"] < 0.35:
-                action = "zoned_out"
-                k_delta = 0.01
-                student["confusion_level"] = min(1.0, student["confusion_level"] + 0.06)
-                understood = False
-            else:
-                action = "engaged"
-                k_delta = 0.06 + 0.02 * student["motivation"]
-                student["confusion_level"] = max(0.0, student["confusion_level"] - 0.03)
-                understood = True
-        elif t == 4:
-            k_delta = 0.02
-            understood = student["confusion_level"] < 0.45 or student["motivation"] > 0.65
-            action = "engaged" if understood else "confused"
-            if not understood:
-                student["confusion_level"] = min(1.0, student["confusion_level"] + 0.05)
-        else:  # 5 update
-            k_delta = 0.03
-            student["cumulative_fatigue"] = min(1.0, student["cumulative_fatigue"] + 0.05)
-            action = "engaged"
-            understood = student["confusion_level"] < 0.55
-
-        for key in list(student["knowledge_state"].keys()):
-            student["knowledge_state"][key] = min(
-                1.0, student["knowledge_state"][key] + k_delta
-            )
-
-        student["attention_remaining"] = max(0.0, student["attention_remaining"] - 0.06)
+        out = run_student_turn(
+            student,
+            current_lesson=state["current_lesson"],
+            timestep=t,
+            module_title=module_title,
+            settings=settings,
+        )
+        apply_agent_output_to_student(
+            student,
+            out,
+            module_title=module_title,
+            timestep=t,
+        )
 
         logs.append(
             {
                 "student_id": sid,
                 "module_index": mi,
                 "timestep": t,
-                "action": action,
-                "understood": understood,
+                "action": out["action"],
+                "understood": bool(out["understood"]),
                 "confusion_level": student["confusion_level"],
                 "attention_remaining": student["attention_remaining"],
-                "knowledge_delta": k_delta,
+                "knowledge_delta": float(out["knowledge_delta"]),
             }
         )
 

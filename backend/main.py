@@ -2,6 +2,15 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# ``agents``, ``orchestrator``, … live next to this file; ensure that dir is on sys.path
+# when uvicorn/python is started with a cwd other than ``backend/``.
+_backend_root = Path(__file__).resolve().parent
+if str(_backend_root) not in sys.path:
+    sys.path.insert(0, str(_backend_root))
+
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI

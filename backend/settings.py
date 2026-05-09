@@ -6,13 +6,19 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _BACKEND_DIR = Path(__file__).resolve().parent
+# Always load env files from the ``backend/`` package directory, not the shell cwd —
+# otherwise ``python agents/test_teacher.py`` from the repo root never sees ``backend/.env.local``.
+_ENV_FILES = (
+    _BACKEND_DIR / ".env",
+    _BACKEND_DIR / ".env.local",
+)
 
 
 class Settings(BaseSettings):
     """Env vars documented in `.env.example` and CLAUDE.md."""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=tuple(str(p) for p in _ENV_FILES),
         env_file_encoding="utf-8",
         extra="ignore",
         populate_by_name=True,
@@ -35,15 +41,11 @@ class Settings(BaseSettings):
     )
 
     default_student_model: str = Field(
-        default="gemini-2.0-flash",
+        default="gemini-3.1-flash-lite",
         alias="DEFAULT_STUDENT_MODEL",
     )
-    default_teacher_model: str = Field(
-        default="gemini-2.0-flash",
-        alias="DEFAULT_TEACHER_MODEL",
-    )
     default_reasoning_model: str = Field(
-        default="gpt-4o",
+        default="gpt-5.5",
         alias="DEFAULT_REASONING_MODEL",
     )
 
