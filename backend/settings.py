@@ -43,6 +43,18 @@ class Settings(BaseSettings):
         alias="DEFAULT_REASONING_MODEL",
     )
 
+    use_llm_assessor: bool = Field(
+        default=True,
+        alias="USE_LLM_ASSESSOR",
+        description="If True and GOOGLE_API_KEY is set, assessor uses Gemini per student.",
+    )
+
+    use_llm_insight: bool = Field(
+        default=True,
+        alias="USE_LLM_INSIGHT",
+        description="If True and an LLM key is set, insight uses OpenAI (or Gemini fallback).",
+    )
+
     enable_visual_report: bool = Field(
         default=False,
         alias="ENABLE_VISUAL_REPORT",
