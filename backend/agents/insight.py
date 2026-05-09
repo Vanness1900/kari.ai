@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import re
+from pathlib import Path
 from statistics import mean
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
+import requests
 
 from orchestrator.state import ClassroomState
 from settings import get_settings
@@ -24,11 +27,12 @@ Your job:
 2) If data is thin, say so briefly and still use what exists.
 3) No medical or clinical diagnoses. Learning patterns are OK when tied to the data.
 4) Bloom labels: 1 Remember, 2 Understand, 3 Apply, 4 Analyse, 5 Evaluate, 6 Create.
+5) Write in a paper-like style with substantial depth. Prefer analytical prose over short bullets.
 
 Return STRICT JSON only (no markdown fences) with this schema:
 {
-  "summary": "string, 2-4 sentences executive summary",
-  "curriculum_critique": "string, markdown with these sections: ## CONFUSION MAP\\n...\\n## CONCEPT ORDERING\\n...\\n## BLOOM ALIGNMENT\\n...\\n## ARCHETYPES\\n...\\n## AT-RISK\\n...\\n## RECOMMENDATIONS\\n...",
+  "summary": "string, 3-6 sentences executive summary",
+  "curriculum_critique": "string, markdown in long-form paper style with sections: ## ABSTRACT\\n...\\n## METHODOLOGY\\n...\\n## RESULTS\\n...\\n## CONFUSION TREND ANALYSIS\\n...\\n## CONCEPT ORDERING ANALYSIS\\n...\\n## BLOOM ALIGNMENT ANALYSIS\\n...\\n## ARCHETYPE PERFORMANCE\\n...\\n## AT-RISK LEARNERS\\n...\\n## RECOMMENDATIONS\\n...\\n## LIMITATIONS\\n...",
   "blooms_alignment_notes": ["string"],
   "concept_ordering_issues": ["string"],
   "recommendations": [
@@ -37,6 +41,8 @@ Return STRICT JSON only (no markdown fences) with this schema:
 }
 
 Use precomputed fields as authoritative signals; refine wording and add actionable recommendations."""
+
+_MAX_IMAGE_TEXT_CHARS = 700
 
 
 def _to_float(value: object, default: float = 0.0) -> float:
@@ -299,6 +305,112 @@ def _parse_llm_json(content: str) -> dict[str, Any]:
     return json.loads(text)
 
 
+def _chunk_text_for_images(text: str, *, max_chars: int = _MAX_IMAGE_TEXT_CHARS) -> list[str]:
+    clean = (text or "").strip()
+    if not clean:
+        return []
+    lines = clean.splitlines()
+    chunks: list[str] = []
+    cur: list[str] = []
+    cur_len = 0
+    for line in lines:
+        # keep paragraphs together when possible, but cap chunk size
+        add_len = len(line) + 1
+        if cur and cur_len + add_len > max_chars:
+            chunks.append("\n".join(cur).strip())
+            cur = [line]
+            cur_len = add_len
+        else:
+            cur.append(line)
+            cur_len += add_len
+    if cur:
+        chunks.append("\n".join(cur).strip())
+    return [c for c in chunks if c]
+
+
+def _generate_visual_report_images(
+    *,
+    session_id: str,
+    title: str,
+    critique_text: str,
+) -> list[str]:
+    settings = get_settings()
+    if not settings.enable_visual_report:
+        return []
+    api_key = (settings.openai_api_key or "").strip()
+    if not api_key:
+        return []
+
+    chunks = _chunk_text_for_images(critique_text)
+    if not chunks:
+        return []
+
+    out_dir = settings.uploads_path / "insight_reports" / session_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    saved: list[str] = []
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    for idx, chunk in enumerate(chunks, start=1):
+        prompt = (
+            "Create an academic paper-style report page, not a slide. "
+            "Use dense readable body text, clear section headers, and a professional white-paper layout "
+            "(white background, black/gray text, minimal accents). "
+            "Include simple line charts where quantitative trends are mentioned (for example confusion across modules, "
+            "retention by module, or score trajectory). Charts must be line charts, not bars/pie. "
+            "Keep charts compact (small side area) so most of the page remains text-heavy. "
+            "Do not summarize, shorten, or paraphrase away details. Preserve the provided text with high fidelity. "
+            "Use smaller but readable body font and tight spacing to fit more content. "
+            f"Title: {title}\n"
+            f"Page {idx}/{len(chunks)}\n\n"
+            f"{chunk}"
+        )
+        payload = {
+            "model": "gpt-image-2",
+            "size": "1024x1536",
+            "prompt": prompt,
+        }
+        try:
+            res = requests.post(
+                "https://api.openai.com/v1/images/generations",
+                headers=headers,
+                json=payload,
+                timeout=240,
+            )
+            if res.status_code != 200:
+                logger.warning("Insight image generation failed (%s): %s", res.status_code, res.text[:500])
+                continue
+            body = res.json()
+            data = body.get("data") if isinstance(body, dict) else None
+            first = data[0] if isinstance(data, list) and data else {}
+            b64 = first.get("b64_json") if isinstance(first, dict) else None
+            if not isinstance(b64, str) or not b64:
+                logger.warning("Insight image generation returned no b64 payload")
+                continue
+            out = out_dir / f"insight_{idx:02d}.png"
+            out.write_bytes(base64.b64decode(b64))
+            saved.append(str(out))
+        except Exception as e:
+            logger.warning("Insight image generation error on chunk %s: %s", idx, e)
+            continue
+    return saved
+
+
+def _attach_visual_images_to_report(report: dict[str, Any], state: ClassroomState) -> dict[str, Any]:
+    title = str(state["curriculum"].get("title") or "Curriculum Insight")
+    critique = str(report.get("curriculum_critique") or "")
+    paths = _generate_visual_report_images(
+        session_id=str(state.get("session_id") or "session_unknown"),
+        title=title,
+        critique_text=critique,
+    )
+    if paths:
+        report["visual_report_images"] = paths
+    return report
+
+
 def _message_content_to_str(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -391,6 +503,7 @@ def _run_insight_llm(state: ClassroomState) -> dict:
         report["concept_ordering_issues"] = parsed["concept_ordering_issues"]
     if isinstance(parsed.get("recommendations"), list):
         report["llm_recommendations"] = parsed["recommendations"]
+    report = _attach_visual_images_to_report(report, state)
 
     settings = get_settings()
     insight_backend = "openai" if (settings.openai_api_key or "").strip() else "gemini"
@@ -409,6 +522,7 @@ def _run_insight_llm(state: ClassroomState) -> dict:
                     "at_risk_count": len(base_report.get("at_risk_students") or []),
                     "insight_mode": "llm",
                     "insight_llm_backend": insight_backend,
+                    "visual_images_count": len(report.get("visual_report_images") or []),
                 },
             }
         ],
@@ -420,6 +534,7 @@ def _run_insight_deterministic(state: ClassroomState) -> dict:
     modules = curriculum.get("modules") or []
     students = state["students"]
     report = _build_insight_report(state)
+    report = _attach_visual_images_to_report(report, state)
     at_risk = report.get("at_risk_students") or []
     return {
         "insight_report": report,
@@ -434,6 +549,7 @@ def _run_insight_deterministic(state: ClassroomState) -> dict:
                     "students_analyzed": len(students),
                     "at_risk_count": len(at_risk),
                     "insight_mode": "deterministic",
+                    "visual_images_count": len(report.get("visual_report_images") or []),
                 },
             }
         ],
