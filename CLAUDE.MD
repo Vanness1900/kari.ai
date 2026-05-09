@@ -18,6 +18,31 @@ ordering, Bloom's taxonomy mismatches, pacing issues, and which student archetyp
 
 ---
 
+## Implementation Status (2026-05-09)
+
+What's actually wired vs aspirational in this doc. Update as code changes.
+
+**Backend — wired:**
+- LangGraph state machine through `orchestrator → timekeeper → (student_questions on t=2) → teacher → student_swarm → peer (stub) → stats`, then `bump_timestep` / `advance_module` / `assessor_phase → insight → END`.
+- Per-node checkpointing: `run_simulation_streaming` uses `graph.stream(stream_mode="values")` and persists `ClassroomState` to `sessions/{id}.json` (atomic write) after every node fires.
+- Endpoints: `POST /api/simulation/start` (BackgroundTasks, returns `{session_id}`), `GET /api/simulation/status`, `/state`, `/events?since=N`, `/api/report/{session_id}`, `/api/sessions`, `/health`. Plus `POST /api/simulation/debug/run` (sync; debugging only).
+- Optional parallelism in student / student_questions / assessor via `ThreadPoolExecutor` (feature-flagged; **not** asyncio.gather).
+- Knowledge gating prompt is enforced inside `agents/student.py` and `agents/student_questions.py`.
+
+**Frontend — wired:**
+- `/` — `ConfigScreen`. Submit POSTs `/api/simulation/start` and routes to `/simulation/[sessionId]`.
+- `/simulation/[sessionId]` — live polling view: `TeacherPanel`, `StudentGrid` (click → `StudentTimeline` drill-down), `QnaTranscript`, `KnowledgeGrowthChart`, `ConfusionHeatmap`. Auto-redirects to report on completion.
+- `/report/[sessionId]` — Insight critique + per-student Assessor cards + the same charts on full-run data.
+- `/main` — legacy demo; still mounted, no longer the destination of ConfigScreen.
+
+**Aspirational / not built yet:**
+- `/api/setup/ingest`, `/api/setup/generate-mcq`, `/api/setup/build-class` endpoints.
+- RAG retrieval into the simulation loop (modules in `rag/` exist as scaffolding only; agents currently don't call them).
+- Dynamic LLM-generated MCQ flow (`/setup/questions` page).
+- GPT Image 2 visual report (gated by `ENABLE_VISUAL_REPORT`).
+
+---
+
 ## Monorepo Structure
 
 ```
@@ -40,10 +65,10 @@ kariai/
 - **Python 3.11+**
 
 ### Frontend
-- **Next.js 14** (App Router)
-- **Tailwind CSS**
-- **Recharts** — Confusion heatmap, retention charts
-- **localStorage** — Session persistence, no database, no auth
+- **Next.js 16** (App Router; React 19.2). NB: dynamic-route `params` is a `Promise` — `await params` in `page.tsx`. `next lint` was removed; the project's `lint` script just runs `eslint`.
+- **Tailwind CSS 4**
+- **Recharts** — line chart for per-student knowledge growth; CSS-grid heatmap for per-module confusion (heatmap is custom, not Recharts).
+- **localStorage / sessionStorage** — config persistence on the client; no auth, no DB.
 
 ### LLMs
 - **Gemini Flash** — Student agents, Teacher agent, Timekeeper (high volume, cheap)
@@ -57,16 +82,32 @@ kariai/
 ## Environment Variables
 
 ```bash
-# backend/.env
+# backend/.env (or backend/.env.local — both are loaded; .env.local wins)
 OPENAI_API_KEY=
-GOOGLE_API_KEY=           # Gemini
+GOOGLE_API_KEY=                 # Gemini
 
 CHROMA_DB_PATH=./chroma_db
 UPLOADS_PATH=./uploads
 SESSIONS_PATH=./sessions
 
 DEFAULT_STUDENT_MODEL=gemini-2.0-flash
+DEFAULT_TEACHER_MODEL=gemini-2.0-flash
 DEFAULT_REASONING_MODEL=gpt-4o
+
+# Concurrency knobs (default false / 4) — see Gotchas
+ENABLE_PARALLEL_STUDENTS=false
+ENABLE_PARALLEL_ASSESSOR=false
+MAX_CONCURRENCY=4
+
+# Optional
+ENABLE_VISUAL_REPORT=false
+CORS_ORIGINS=http://localhost:3000
+KARIAI_TRACE=                   # set to 1 to log each LangGraph node
+```
+
+```bash
+# frontend/.env.local
+NEXT_PUBLIC_API_URL=http://localhost:8000   # base URL for backend; defaults to localhost:8000 if unset
 ```
 
 ---
@@ -94,33 +135,49 @@ python -m rag.ingest --module m1 --file uploads/m1_slides.pdf
 
 ### FastAPI Routes
 
+Currently implemented in `backend/main.py`:
+
 ```
-POST /api/setup/ingest        # Upload syllabus + slides → ChromaDB
-POST /api/setup/generate-mcq  # LLM reads syllabus, returns dynamic MCQs
-POST /api/setup/build-class   # Form answers → student profiles JSON
-POST /api/simulation/start    # Kicks off LangGraph simulation
-GET  /api/simulation/status   # Poll simulation progress
-GET  /api/report/{session_id} # Returns insight report
+GET  /health                             # liveness probe
+POST /api/simulation/start               # body: StartRequest; kicks off run via BackgroundTasks; returns {session_id, status:"running"}
+GET  /api/simulation/status?id=X         # cheap projection: current_module/timestep, log_count, simulation_complete, has_insight, has_error
+GET  /api/simulation/state?id=X          # full ClassroomState snapshot (heavier; pull on phase change)
+GET  /api/simulation/events?id=X&since=N # incremental slice of timestep_logs (cheap polling target)
+GET  /api/sessions                       # newest-first list of saved sessions
+GET  /api/report/{session_id}            # insight_report + student_assessments + students + curriculum + logs (409 until complete)
+POST /api/simulation/debug/run           # synchronous full run; returns final state — debugging only
 ```
+
+Planned but not yet implemented: `/api/setup/ingest`, `/api/setup/generate-mcq`, `/api/setup/build-class`.
 
 ### LangGraph State Machine
 
 The orchestrator is a LangGraph `StateGraph`. Every agent is a node. State is passed between nodes.
 
 ```python
-# orchestrator/state.py — ClassroomState shape (conceptual)
+# orchestrator/state.py — ClassroomState shape (matches code as of 2026-05-09)
 class ClassroomState(TypedDict):
     session_id: str
     curriculum: CurriculumConfig
-    students: list[StudentProfile]
+    students: list[StudentProfileDict]
     current_module: int
-    current_timestep: int        # 1=deliver, 2=qna, 3=exercise, 4=assess, 5=update
-    timestep_logs: list[TimestepLog]   # full trace across the whole run (source of truth for growth)
-    # Assessor (after loop): one structured record per student — NOT a single whole-class verdict.
-    # Value shape → define AssessmentRecord TypedDict in code (scores, growth notes, at_risk, ...).
-    student_assessments: dict[str, dict] | None
+    current_timestep: int                       # 1=deliver, 2=qna, 3=exercise, 4=assess, 5=update
+
+    # List fields use Annotated[list[...], operator.add] so node partials append rather than replace.
+    timestep_logs: Annotated[list[TimestepLog], operator.add]
+    module_results: Annotated[list[ModuleResult], operator.add]
+
+    # Per-student post-course assessments (filled sequentially in assessor phase). NOT a whole-class lump.
+    student_assessments: dict[str, AssessmentRecord] | None
+    assessor_index: int                         # progress cursor inside assessor phase
+
     simulation_complete: bool
     insight_report: InsightReport | None
+
+    current_lesson: str | None                  # latest teacher output for the active phase
+    module_delivery_snapshot: str | None        # captured at timestep 1; QNA students reason against this
+    qna_student_questions: list[dict[str, Any]] # filled by student_questions node, consumed by teacher on t=2
+    avg_confusion_last: NotRequired[float]      # rolling mean of student confusion (set by stats node)
 ```
 
 ### Graph Flow
@@ -349,18 +406,23 @@ Session ID format: `session_YYYYMMDD_HHMMSS`
 
 | Route | Purpose |
 |---|---|
-| `/` | Landing page, start new simulation |
-| `/setup` | Static input form (course info, student config, Bloom's) |
-| `/setup/questions` | Dynamic LLM-generated MCQs about the curriculum |
-| `/simulation` | Live simulation progress — module by module |
-| `/report/[sessionId]` | Full insight report with charts |
+| `/` | `ConfigScreen`: form (course info, vision/mission, Bloom level, sliders) → POST `/api/simulation/start` → navigate to `/simulation/[id]` |
+| `/simulation/[sessionId]` | Live polling view: teacher panel, student grid w/ drill-down timeline, QNA transcript, knowledge-growth line chart, confusion heatmap. Auto-redirects to report on completion. |
+| `/report/[sessionId]` | Post-run deep-dive: Insight critique + per-student Assessor cards + the same charts on full data |
+| `/main` | Legacy demo (`MainScreen` with hardcoded transcript). No longer the destination of the form. |
 
-### localStorage Keys
-```
-kari_current_session    → session ID of active simulation
-kari_setup_form         → partial form state (for page refresh survival)
-kari_sessions           → array of past session IDs
-```
+Planned: `/setup/questions` (dynamic MCQ flow). The setup form currently lives at `/`.
+
+### Storage keys (client)
+
+`frontend/src/lib/config-storage.ts`:
+- `kari-curriculum-config` (sessionStorage) — last submitted form state.
+
+`frontend/src/lib/local-import-storage.ts`:
+- `curriculum` (localStorage) — imported curriculum PDFs/images.
+- `content` (localStorage) — imported supporting content PDFs/images.
+
+(Earlier docs referenced `kari_current_session`/`kari_setup_form`/`kari_sessions`; those keys are not used in code today.)
 
 ### Polling Pattern (Simulation Page)
 ```typescript
@@ -443,9 +505,11 @@ BLOOMS_LEVELS = {
 
 ## Known Constraints & Gotchas
 
-- **Sequential student calls** — students run one at a time, not truly parallel.
-  This is intentional. One shared Gemini Flash model, queued calls. Do NOT use
-  `asyncio.gather` for student agent calls — it causes rate limit errors.
+- **Student / assessor concurrency is opt-in.** Default is sequential. Set
+  `ENABLE_PARALLEL_STUDENTS=true` and/or `ENABLE_PARALLEL_ASSESSOR=true` and tune
+  `MAX_CONCURRENCY` (default 4) to fan out via `ThreadPoolExecutor`. Do **not** use
+  `asyncio.gather` for these calls — it causes rate-limit errors. Threads are fine
+  because the LLM client releases the GIL during network I/O.
 
 - **ChromaDB resets between sessions** — each new simulation ingests fresh.
   Do not assume collections persist across server restarts in dev.

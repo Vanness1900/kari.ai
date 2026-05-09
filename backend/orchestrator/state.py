@@ -53,6 +53,12 @@ class InsightReport(TypedDict, total=False):
     summary: str
     curriculum_critique: str
     blooms_alignment_notes: list[str]
+    confusion_map: list[dict[str, Any]]
+    concept_ordering_issues: list[str]
+    student_archetype_performance: dict[str, float]
+    at_risk_students: list[dict[str, Any]]
+    llm_recommendations: list[dict[str, Any]]
+    visual_report_images: list[str]
 
 
 class AssessmentRecord(TypedDict, total=False):
