@@ -80,10 +80,10 @@ class ClassroomState(TypedDict):
     students: list[StudentProfile]
 
     current_module: int
-    current_timestep: int  # 1–5 deliver/process/exercise/assess/update
+    # 1=deliver 2=qna 3=exercise 4=assess 5=update (per module, then advance_module)
+    current_timestep: int
 
     current_lesson: str | None
-    reteach_count_this_module: int
 
     timestep_logs: list[TimestepLog]
     module_results: list[ModuleResult]
@@ -162,7 +162,6 @@ def blank_classroom_state(session_id: str = "session_dev") -> ClassroomState:
         "current_module": 0,
         "current_timestep": 1,
         "current_lesson": None,
-        "reteach_count_this_module": 0,
         "timestep_logs": [],
         "module_results": [],
         "student_assessments": None,
